@@ -30,7 +30,8 @@
         <div class="px-4 py-2 border-b flex items-center justify-between">
           <div class="font-medium">Совместный редактор</div>
           <div class="text-sm text-gray-500">
-            Фаза B: общий текст + курсоры/выделения других пользователей
+            Фаза C: общий текст + курсоры + общие комментарии (без привязки к
+            тексту)
           </div>
         </div>
 
@@ -56,7 +57,7 @@
         <input
           v-model="addText"
           type="text"
-          placeholder="Текст комментария… (пока локально)"
+          placeholder="Текст комментария…"
           class="border rounded px-3 py-2 flex-1 bg-white"
         />
         <button
@@ -64,21 +65,19 @@
           :disabled="!canAdd"
           @click="addCommentFromSelection"
         >
-          Комментировать выделение
+          Комментировать (пока без привязки)
         </button>
       </div>
 
       <p class="text-sm text-gray-500 mt-1">
-        Фаза B: открой редактор в нескольких вкладках/браузерах — увидишь
-        курсоры и список пользователей.
+        Фаза C: комментарии синхронятся между вкладками, но ещё не «привязаны» к
+        выделению в тексте.
       </p>
     </div>
 
     <aside class="w-[340px] shrink-0">
       <div class="border rounded-lg bg-white">
-        <div class="px-4 py-2 border-b font-medium">
-          Комментарии (пока локальные)
-        </div>
+        <div class="px-4 py-2 border-b font-medium">Комментарии (общие)</div>
 
         <div class="max-h-[60vh] overflow-auto divide-y">
           <div
@@ -127,6 +126,7 @@ import StarterKit from '@tiptap/starter-kit';
 import Collaboration from '@tiptap/extension-collaboration';
 import CollaborationCaret from '@tiptap/extension-collaboration-caret';
 import { HocuspocusProvider } from '@hocuspocus/provider';
+import type { Doc, Map as YMap } from 'yjs';
 
 interface commentData {
   id: string;
@@ -148,7 +148,7 @@ interface awarenessUser {
 }
 
 // --------------------
-// Генерация пользователя (теперь один случайный юзер на вкладку)
+// Генерация пользователя (один случайный юзер на вкладку)
 // --------------------
 
 function createRandomColor(): string {
@@ -164,7 +164,6 @@ function createRandomUser(): collabUser {
   };
 }
 
-// Каждый таб теперь получает своего рандомного юзера
 const currentUser: collabUser = createRandomUser();
 
 // --------------------
@@ -179,10 +178,13 @@ const provider = new HocuspocusProvider({
   name: documentName,
 });
 
-const ydoc = provider.document;
+const ydoc = provider.document as Doc;
+
+// Y.Map для комментариев — единый источник правды
+const commentsMap: YMap<commentData> = ydoc.getMap<commentData>('comments');
 
 // --------------------
-// Список онлайн-пользователей через awareness
+// Vue-реактивный список онлайн-пользователей (awareness)
 // --------------------
 
 const onlineUsers = ref<awarenessUser[]>([]);
@@ -216,6 +218,21 @@ function updateOnlineUsersFromStates(
 }
 
 // --------------------
+// Vue-реактивный список комментариев — как проекция Y.Map
+// --------------------
+
+const comments = ref<commentData[]>([]);
+
+function updateCommentsFromYjs(): void {
+  const next: commentData[] = [];
+  commentsMap.forEach((value) => {
+    next.push(value);
+  });
+  // При желании здесь можно сортировать (по id/createdAt)
+  comments.value = next;
+}
+
+// --------------------
 // Tiptap Editor + Collaboration + CollaborationCaret
 // --------------------
 
@@ -243,7 +260,6 @@ const editor = useEditor({
 });
 
 const addText = ref<string>('');
-const comments = ref<commentData[]>([]);
 
 const canAdd = computed<boolean>(() => {
   const textFilled = addText.value.trim().length > 0;
@@ -256,27 +272,36 @@ let awarenessChangeHandler:
     }) => void)
   | null = null;
 
+let commentsObserver: ((event: unknown, transaction: unknown) => void) | null =
+  null;
+
 onMounted(() => {
   provider.on('status', (event: { status: string }) => {
     // eslint-disable-next-line no-console
     console.log('[hocuspocus] status:', event.status);
   });
 
-  // Подписка на изменения awareness (список пользователей)
+  // Подписка на изменения списка пользователей
   awarenessChangeHandler = (payload) => {
     updateOnlineUsersFromStates(payload.states);
   };
-
   provider.on('awarenessChange', awarenessChangeHandler);
 
-  // Инициализация списка по текущему состоянию
   const states = provider.awareness?.getStates() as
     | Map<number, { user?: { name?: string; color?: string } }>
     | undefined;
-
   if (states) {
     updateOnlineUsersFromStates(states);
   }
+
+  // Подписка на изменения Y.Map с комментариями
+  commentsObserver = (): void => {
+    updateCommentsFromYjs();
+  };
+  commentsMap.observe(commentsObserver);
+
+  // Инициализировать комментарии из уже существующего состояния Y.Doc (если есть)
+  updateCommentsFromYjs();
 
   // eslint-disable-next-line no-console
   console.log('[editor] instance', editor.value);
@@ -287,11 +312,18 @@ onBeforeUnmount(() => {
     provider.off('awarenessChange', awarenessChangeHandler);
   }
 
+  if (commentsObserver) {
+    commentsMap.unobserve(commentsObserver);
+  }
+
   editor.value?.destroy();
   provider.destroy();
 });
 
-// Комментарии пока локальные
+// --------------------
+// Операции с комментариями — через Yjs-транзакции
+// --------------------
+
 const addCommentFromSelection = () => {
   if (!editor.value) return;
 
@@ -303,24 +335,39 @@ const addCommentFromSelection = () => {
       ? crypto.randomUUID()
       : String(Date.now());
 
-  comments.value.push({
+  const newComment: commentData = {
     id,
     text,
     authorName: currentUser.name,
     resolved: false,
+  };
+
+  // Запись в Yjs: комментарий появится у всех клиентов
+  ydoc.transact(() => {
+    commentsMap.set(id, newComment);
   });
 
   addText.value = '';
 };
 
 const resolveComment = (id: string, resolved: boolean) => {
-  comments.value = comments.value.map((c) =>
-    c.id === id ? { ...c, resolved } : c
-  );
+  const existing = commentsMap.get(id);
+  if (!existing) return;
+
+  const updated: commentData = {
+    ...existing,
+    resolved,
+  };
+
+  ydoc.transact(() => {
+    commentsMap.set(id, updated);
+  });
 };
 
 const removeComment = (id: string) => {
-  comments.value = comments.value.filter((c) => c.id !== id);
+  ydoc.transact(() => {
+    commentsMap.delete(id);
+  });
 };
 </script>
 
@@ -329,7 +376,7 @@ const removeComment = (id: string) => {
   cursor: pointer;
 }
 
-/* Кастомный курсор других пользователей — как делали раньше */
+/* Кастомный курсор других пользователей */
 :global(.tiptap .collaboration-carets__caret) {
   position: relative;
   border-left-width: 0;
