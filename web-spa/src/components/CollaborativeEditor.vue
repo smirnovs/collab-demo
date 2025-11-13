@@ -1,11 +1,36 @@
 <template>
   <div class="container mx-auto max-w-6xl p-6 flex gap-4">
     <div class="flex-1">
+      <!-- Онлайн-пользователи -->
+      <div class="mb-3 flex items-center gap-2 text-xs text-gray-600">
+        <span class="font-medium">Онлайн:</span>
+
+        <template v-if="onlineUsers.length > 0">
+          <span
+            v-for="user in onlineUsers"
+            :key="user.clientId"
+            class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full border bg-white"
+            :class="user.isLocal ? 'border-blue-500' : 'border-gray-300'"
+          >
+            <span
+              class="inline-block h-2 w-2 rounded-full"
+              :style="{ backgroundColor: user.color }"
+            />
+            <span>
+              {{ user.name }}
+              <span v-if="user.isLocal">(я)</span>
+            </span>
+          </span>
+        </template>
+
+        <span v-else>один пользователь</span>
+      </div>
+
       <div class="border rounded-lg bg-white">
         <div class="px-4 py-2 border-b flex items-center justify-between">
           <div class="font-medium">Совместный редактор</div>
           <div class="text-sm text-gray-500">
-            Фаза A: общий текст через Yjs + Hocuspocus
+            Фаза B: общий текст + курсоры/выделения других пользователей
           </div>
         </div>
 
@@ -14,6 +39,16 @@
           <div v-else class="text-sm text-gray-500">
             Инициализация редактора…
           </div>
+        </div>
+
+        <div
+          class="px-4 py-2 border-t text-xs text-gray-500 flex items-center gap-2"
+        >
+          <span
+            class="inline-block h-3 w-3 rounded-full"
+            :style="{ backgroundColor: currentUser.color }"
+          />
+          <span>Текущий пользователь: {{ currentUser.name }}</span>
         </div>
       </div>
 
@@ -34,14 +69,15 @@
       </div>
 
       <p class="text-sm text-gray-500 mt-1">
-        Фаза A: текст уже общий между вкладками, комментарии пока локальные.
+        Фаза B: открой редактор в нескольких вкладках/браузерах — увидишь
+        курсоры и список пользователей.
       </p>
     </div>
 
     <aside class="w-[340px] shrink-0">
       <div class="border rounded-lg bg-white">
         <div class="px-4 py-2 border-b font-medium">
-          Комментарии (локальные)
+          Комментарии (пока локальные)
         </div>
 
         <div class="max-h-[60vh] overflow-auto divide-y">
@@ -86,10 +122,10 @@
 
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
-import { useEditor, EditorContent, type Editor } from '@tiptap/vue-3';
+import { useEditor, EditorContent } from '@tiptap/vue-3';
 import StarterKit from '@tiptap/starter-kit';
 import Collaboration from '@tiptap/extension-collaboration';
-
+import CollaborationCaret from '@tiptap/extension-collaboration-caret';
 import { HocuspocusProvider } from '@hocuspocus/provider';
 
 interface commentData {
@@ -99,41 +135,104 @@ interface commentData {
   resolved: boolean;
 }
 
+interface collabUser {
+  name: string;
+  color: string;
+}
+
+interface awarenessUser {
+  clientId: number;
+  name: string;
+  color: string;
+  isLocal: boolean;
+}
+
 // --------------------
-// Yjs + Hocuspocus (Фаза A)
+// Генерация пользователя (теперь один случайный юзер на вкладку)
 // --------------------
 
-// Идентификатор документа (должен быть одинаковым для всех клиентов одного документа)
+function createRandomColor(): string {
+  const hue = Math.floor(Math.random() * 360);
+  return `hsl(${hue} 80% 60%)`;
+}
+
+function createRandomUser(): collabUser {
+  const suffix = Math.floor(Math.random() * 9000) + 1000;
+  return {
+    name: `User ${suffix}`,
+    color: createRandomColor(),
+  };
+}
+
+// Каждый таб теперь получает своего рандомного юзера
+const currentUser: collabUser = createRandomUser();
+
+// --------------------
+// Yjs + Hocuspocus
+// --------------------
+
 const documentName = 'demo-document-1';
-
-// URL Hocuspocus-сервера
 const hocuspocusUrl = 'ws://localhost:1234';
 
-// Провайдер WebSocket, внутри он создаёт Y.Doc и даёт доступ через provider.document
 const provider = new HocuspocusProvider({
   url: hocuspocusUrl,
   name: documentName,
 });
 
-// На будущее (Фазы C+): доступ к Y.Doc для комментариев и др.
 const ydoc = provider.document;
 
 // --------------------
-// Tiptap Editor
+// Список онлайн-пользователей через awareness
+// --------------------
+
+const onlineUsers = ref<awarenessUser[]>([]);
+
+function updateOnlineUsersFromStates(
+  states: Map<number, { user?: { name?: string; color?: string } }>
+): void {
+  const localClientId = provider.awareness?.clientID ?? -1;
+
+  const result: awarenessUser[] = [];
+
+  states.forEach((state, clientId) => {
+    const user = state.user;
+    if (
+      !user ||
+      typeof user.name !== 'string' ||
+      typeof user.color !== 'string'
+    ) {
+      return;
+    }
+
+    result.push({
+      clientId,
+      name: user.name,
+      color: user.color,
+      isLocal: clientId === localClientId,
+    });
+  });
+
+  onlineUsers.value = result;
+}
+
+// --------------------
+// Tiptap Editor + Collaboration + CollaborationCaret
 // --------------------
 
 const editor = useEditor({
   extensions: [
     StarterKit.configure({
-      // В v3 нужно отключать не history, а undoRedo
-      // потому что Collaboration сам управляет undo/redo
       undoRedo: false,
     }),
     Collaboration.configure({
-      // Важно: сюда передаётся Y.Doc, а не XmlFragment
-      // и не отдельный ydoc.getXmlFragment(...)
       document: ydoc,
-      // при желании можно указать field: 'body' и т.п.
+    }),
+    CollaborationCaret.configure({
+      provider,
+      user: {
+        name: currentUser.name,
+        color: currentUser.color,
+      },
     }),
   ],
   editable: true,
@@ -151,22 +250,48 @@ const canAdd = computed<boolean>(() => {
   return textFilled && !!editor.value;
 });
 
+let awarenessChangeHandler:
+  | ((payload: {
+      states: Map<number, { user?: { name?: string; color?: string } }>;
+    }) => void)
+  | null = null;
+
 onMounted(() => {
   provider.on('status', (event: { status: string }) => {
     // eslint-disable-next-line no-console
     console.log('[hocuspocus] status:', event.status);
   });
 
+  // Подписка на изменения awareness (список пользователей)
+  awarenessChangeHandler = (payload) => {
+    updateOnlineUsersFromStates(payload.states);
+  };
+
+  provider.on('awarenessChange', awarenessChangeHandler);
+
+  // Инициализация списка по текущему состоянию
+  const states = provider.awareness?.getStates() as
+    | Map<number, { user?: { name?: string; color?: string } }>
+    | undefined;
+
+  if (states) {
+    updateOnlineUsersFromStates(states);
+  }
+
   // eslint-disable-next-line no-console
   console.log('[editor] instance', editor.value);
 });
 
 onBeforeUnmount(() => {
+  if (awarenessChangeHandler) {
+    provider.off('awarenessChange', awarenessChangeHandler);
+  }
+
   editor.value?.destroy();
-  provider.destroy(); // разорвёт WS и освободит ресурсы
+  provider.destroy();
 });
 
-// Пока комментарии не связаны с Yjs — оставлена локальная реализация
+// Комментарии пока локальные
 const addCommentFromSelection = () => {
   if (!editor.value) return;
 
@@ -181,7 +306,7 @@ const addCommentFromSelection = () => {
   comments.value.push({
     id,
     text,
-    authorName: 'User',
+    authorName: currentUser.name,
     resolved: false,
   });
 
@@ -202,5 +327,38 @@ const removeComment = (id: string) => {
 <style scoped>
 .prose :global(span[data-comment-id]) {
   cursor: pointer;
+}
+
+/* Кастомный курсор других пользователей — как делали раньше */
+:global(.tiptap .collaboration-carets__caret) {
+  position: relative;
+  border-left-width: 0;
+  border-left-style: none;
+  pointer-events: none;
+}
+
+:global(.tiptap .collaboration-carets__caret::after) {
+  content: '';
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  left: 0;
+  border-left-width: 2px;
+  border-left-style: solid;
+  border-left-color: inherit;
+}
+
+:global(.tiptap .collaboration-carets__label) {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  transform: translate(-50%, -4px);
+  padding: 0 6px;
+  border-radius: 9999px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: #fff;
+  white-space: nowrap;
+  pointer-events: none;
 }
 </style>
