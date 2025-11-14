@@ -30,8 +30,8 @@
         <div class="px-4 py-2 border-b flex items-center justify-between">
           <div class="font-medium">Совместный редактор</div>
           <div class="text-sm text-gray-500">
-            Фаза C: общий текст + курсоры + общие комментарии (без привязки к
-            тексту)
+            Фаза C/D: общий текст + курсоры + общие комментарии (якоря по
+            выделению уже сохраняются, но ещё не подсвечиваются)
           </div>
         </div>
 
@@ -65,20 +65,20 @@
           :disabled="!canAdd"
           @click="addCommentFromSelection"
         >
-          Комментировать (пока без привязки)
+          Комментировать выделение
         </button>
       </div>
 
       <p class="text-sm text-gray-500 mt-1">
-        Фаза C: комментарии синхронятся между вкладками, но ещё не «привязаны» к
-        выделению в тексте.
+        Фаза D: комментарии уже привязаны к выделению через RelativePosition в
+        Yjs, но подсветки внутри текста пока нет — появится на следующем шаге
+        через ProseMirror plugin.
       </p>
     </div>
 
     <aside class="w-[340px] shrink-0">
       <div class="border rounded-lg bg-white">
         <div class="px-4 py-2 border-b font-medium">Комментарии (общие)</div>
-
         <div class="max-h-[60vh] overflow-auto divide-y">
           <div
             v-for="c in comments"
@@ -126,13 +126,25 @@ import StarterKit from '@tiptap/starter-kit';
 import Collaboration from '@tiptap/extension-collaboration';
 import CollaborationCaret from '@tiptap/extension-collaboration-caret';
 import { HocuspocusProvider } from '@hocuspocus/provider';
-import type { Doc, Map as YMap } from 'yjs';
+import * as Y from 'yjs';
+import {
+  ySyncPluginKey,
+  absolutePositionToRelativePosition,
+  relativePositionToAbsolutePosition,
+} from '@tiptap/y-tiptap';
+
+interface commentAnchor {
+  // base64-сериализация Y.RelativePosition для начала и конца выделения
+  start: string;
+  end: string;
+}
 
 interface commentData {
   id: string;
   text: string;
   authorName: string;
   resolved: boolean;
+  anchor: commentAnchor;
 }
 
 interface collabUser {
@@ -145,6 +157,17 @@ interface awarenessUser {
   name: string;
   color: string;
   isLocal: boolean;
+}
+
+interface YSyncBinding {
+  // тип привязан к внутренностям y-prosemirror, поэтому используется unknown
+  mapping: unknown;
+}
+
+interface YSyncState {
+  doc: Y.Doc;
+  type: unknown;
+  binding: YSyncBinding;
 }
 
 // --------------------
@@ -178,10 +201,10 @@ const provider = new HocuspocusProvider({
   name: documentName,
 });
 
-const ydoc = provider.document as Doc;
+const ydoc = provider.document as Y.Doc;
 
 // Y.Map для комментариев — единый источник правды
-const commentsMap: YMap<commentData> = ydoc.getMap<commentData>('comments');
+const commentsMap: Y.Map<commentData> = ydoc.getMap<commentData>('comments');
 
 // --------------------
 // Vue-реактивный список онлайн-пользователей (awareness)
@@ -228,8 +251,36 @@ function updateCommentsFromYjs(): void {
   commentsMap.forEach((value) => {
     next.push(value);
   });
-  // При желании здесь можно сортировать (по id/createdAt)
   comments.value = next;
+}
+
+// --------------------
+// Вспомогательные функции для работы с RelativePosition
+// --------------------
+
+function getYSyncStateFromEditor(): YSyncState | null {
+  const ed = editor.value;
+  if (!ed) return null;
+
+  const raw = ySyncPluginKey.getState(ed.state) as
+    | (YSyncState & { binding: YSyncBinding | null })
+    | null
+    | undefined;
+
+  if (!raw || !raw.doc || !raw.type || !raw.binding || !raw.binding.mapping) {
+    return null;
+  }
+
+  return raw as YSyncState;
+}
+
+function relativePositionToBase64(relPos: Y.RelativePosition): string {
+  const encoded = Y.encodeRelativePosition(relPos);
+  let binary = '';
+  for (let i = 0; i < encoded.length; i += 1) {
+    binary += String.fromCharCode(encoded[i]);
+  }
+  return btoa(binary);
 }
 
 // --------------------
@@ -239,6 +290,7 @@ function updateCommentsFromYjs(): void {
 const editor = useEditor({
   extensions: [
     StarterKit.configure({
+      // важно: именно undoRedo, а не history
       undoRedo: false,
     }),
     Collaboration.configure({
@@ -263,6 +315,7 @@ const addText = ref<string>('');
 
 const canAdd = computed<boolean>(() => {
   const textFilled = addText.value.trim().length > 0;
+  // На этом шаге блокируется только пустой текст; проверка выделения — внутри addCommentFromSelection
   return textFilled && !!editor.value;
 });
 
@@ -324,11 +377,54 @@ onBeforeUnmount(() => {
 // Операции с комментариями — через Yjs-транзакции
 // --------------------
 
-const addCommentFromSelection = () => {
-  if (!editor.value) return;
+const addCommentFromSelection = (): void => {
+  const ed = editor.value;
+  if (!ed) return;
 
   const text = addText.value.trim();
   if (!text) return;
+
+  const { from, to, empty } = ed.state.selection;
+
+  // На шаге D комментарий добавляется только к непустому выделению
+  if (empty) {
+    // eslint-disable-next-line no-console
+    console.warn('[comments] selection is empty, comment not created');
+    return;
+  }
+
+  const yState = getYSyncStateFromEditor();
+  if (!yState) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[comments] ySync state is not available, comment not created'
+    );
+    return;
+  }
+
+  const startRel = absolutePositionToRelativePosition(
+    from,
+    yState.type,
+    yState.binding.mapping
+  );
+  const endRel = absolutePositionToRelativePosition(
+    to,
+    yState.type,
+    yState.binding.mapping
+  );
+
+  if (!startRel || !endRel) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      '[comments] failed to create relative positions for selection'
+    );
+    return;
+  }
+
+  const anchor: commentAnchor = {
+    start: relativePositionToBase64(startRel),
+    end: relativePositionToBase64(endRel),
+  };
 
   const id =
     typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -340,9 +436,10 @@ const addCommentFromSelection = () => {
     text,
     authorName: currentUser.name,
     resolved: false,
+    anchor,
   };
 
-  // Запись в Yjs: комментарий появится у всех клиентов
+  // Запись в Yjs: комментарий с якорем появится у всех клиентов
   ydoc.transact(() => {
     commentsMap.set(id, newComment);
   });
@@ -350,7 +447,7 @@ const addCommentFromSelection = () => {
   addText.value = '';
 };
 
-const resolveComment = (id: string, resolved: boolean) => {
+const resolveComment = (id: string, resolved: boolean): void => {
   const existing = commentsMap.get(id);
   if (!existing) return;
 
@@ -364,7 +461,7 @@ const resolveComment = (id: string, resolved: boolean) => {
   });
 };
 
-const removeComment = (id: string) => {
+const removeComment = (id: string): void => {
   ydoc.transact(() => {
     commentsMap.delete(id);
   });
