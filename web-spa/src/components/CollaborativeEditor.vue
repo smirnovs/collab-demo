@@ -84,7 +84,13 @@
             v-for="c in comments"
             :key="c.id"
             class="p-3 hover:bg-gray-50"
-            :class="{ 'opacity-60 line-through': c.resolved }"
+            :class="[
+              {
+                'opacity-60 line-through': c.resolved,
+                'bg-blue-100 ring-1 ring-blue-200': activeCommentId === c.id,
+              },
+            ]"
+            @click="focusCommentById(c.id)"
           >
             <div class="text-sm font-medium">
               {{ c.authorName }}
@@ -132,6 +138,31 @@ import {
   absolutePositionToRelativePosition,
   relativePositionToAbsolutePosition,
 } from '@tiptap/y-tiptap';
+import type { Node as ProsemirrorNode } from '@tiptap/pm/model';
+import {
+  Plugin,
+  PluginKey,
+  type EditorState,
+  type Transaction,
+} from '@tiptap/pm/state';
+import { Decoration, DecorationSet } from '@tiptap/pm/view';
+import type { EditorView } from '@tiptap/pm/view';
+import { Extension } from '@tiptap/core';
+
+// --------------------
+// Типы
+// --------------------
+
+type ProsemirrorMapping = Map<
+  Y.AbstractType<unknown>,
+  ProsemirrorNode | ProsemirrorNode[]
+>;
+
+interface CommentsPluginOptions {
+  getComments: () => commentData[];
+  getActiveCommentId: () => string | null;
+  onCommentClick?: (id: string) => void;
+}
 
 interface commentAnchor {
   // base64-сериализация Y.RelativePosition для начала и конца выделения
@@ -160,13 +191,12 @@ interface awarenessUser {
 }
 
 interface YSyncBinding {
-  // тип привязан к внутренностям y-prosemirror, поэтому используется unknown
-  mapping: unknown;
+  mapping: ProsemirrorMapping;
 }
 
 interface YSyncState {
   doc: Y.Doc;
-  type: unknown;
+  type: Y.XmlFragment;
   binding: YSyncBinding;
 }
 
@@ -241,10 +271,11 @@ function updateOnlineUsersFromStates(
 }
 
 // --------------------
-// Vue-реактивный список комментариев — как проекция Y.Map
+// Vue-реактивный список комментариев — проекция Y.Map
 // --------------------
 
 const comments = ref<commentData[]>([]);
+const activeCommentId = ref<string | null>(null);
 
 function updateCommentsFromYjs(): void {
   const next: commentData[] = [];
@@ -255,33 +286,288 @@ function updateCommentsFromYjs(): void {
 }
 
 // --------------------
-// Вспомогательные функции для работы с RelativePosition
+// Вспомогательные функции для RelativePosition
 // --------------------
 
-function getYSyncStateFromEditor(): YSyncState | null {
-  const ed = editor.value;
-  if (!ed) return null;
+function relativePositionToBase64(relPos: Y.RelativePosition): string {
+  const encoded = Y.encodeRelativePosition(relPos);
+  let binary = '';
 
-  const raw = ySyncPluginKey.getState(ed.state) as
+  for (const byte of encoded) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary);
+}
+
+function base64ToRelativePosition(encoded: string): Y.RelativePosition {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+
+  return Y.decodeRelativePosition(bytes);
+}
+
+// --------------------
+// ProseMirror Plugin для подсветки диапазонов комментариев
+// --------------------
+
+const commentsPluginKey = new PluginKey<DecorationSet>('comments-plugin');
+
+function focusCommentById(id: string): void {
+  activeCommentId.value = id;
+
+  const ed = editor.value;
+  if (!ed) return;
+
+  const comment = comments.value.find((c) => c.id === id);
+  if (!comment) return;
+
+  const yState = getYSyncStateFromEditor();
+  if (!yState) return;
+
+  try {
+    const startRel = base64ToRelativePosition(comment.anchor.start);
+    const endRel = base64ToRelativePosition(comment.anchor.end);
+
+    const startAbs = relativePositionToAbsolutePosition(
+      yState.doc,
+      yState.type,
+      startRel,
+      yState.binding.mapping
+    );
+    const endAbs = relativePositionToAbsolutePosition(
+      yState.doc,
+      yState.type,
+      endRel,
+      yState.binding.mapping
+    );
+
+    if (startAbs === null || endAbs === null) return;
+
+    const from = Math.min(startAbs, endAbs);
+    const to = Math.max(startAbs, endAbs);
+    if (from === to) return;
+
+    // Фокус на редакторе, но БЕЗ изменения selection
+    ed.view.focus();
+
+    // Скроллим DOM-узел, соответствующий началу диапазона
+    const domPos = ed.view.domAtPos(from);
+    let target: HTMLElement | null = null;
+
+    if (domPos.node.nodeType === Node.TEXT_NODE) {
+      target = domPos.node.parentElement;
+    } else if (domPos.node instanceof HTMLElement) {
+      target = domPos.node;
+    }
+
+    if (target) {
+      target.scrollIntoView({ block: 'center' });
+    }
+
+    // Триггер пересчёта декораций для подсветки активного комментария
+    const tr = ed.state.tr.setMeta(commentsPluginKey, {
+      type: 'active-comment-changed',
+      id,
+    });
+    ed.view.dispatch(tr);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn('[comments] failed to focus comment', id, error);
+  }
+}
+
+function createDecorations(params: {
+  state: EditorState;
+  comments: commentData[];
+  activeCommentId: string | null;
+}): DecorationSet {
+  const { state, comments, activeCommentId } = params;
+
+  const raw = ySyncPluginKey.getState(state) as
     | (YSyncState & { binding: YSyncBinding | null })
     | null
     | undefined;
 
   if (!raw || !raw.doc || !raw.type || !raw.binding || !raw.binding.mapping) {
-    return null;
+    return DecorationSet.empty;
   }
 
-  return raw as YSyncState;
+  const yState = raw as YSyncState;
+
+  const decorations: Decoration[] = [];
+
+  for (const comment of comments) {
+    if (comment.resolved) continue;
+
+    try {
+      const startRel = base64ToRelativePosition(comment.anchor.start);
+      const endRel = base64ToRelativePosition(comment.anchor.end);
+
+      const startAbs = relativePositionToAbsolutePosition(
+        yState.doc,
+        yState.type,
+        startRel,
+        yState.binding.mapping
+      );
+      const endAbs = relativePositionToAbsolutePosition(
+        yState.doc,
+        yState.type,
+        endRel,
+        yState.binding.mapping
+      );
+
+      if (startAbs === null || endAbs === null) {
+        continue;
+      }
+
+      const from = Math.min(startAbs, endAbs);
+      const to = Math.max(startAbs, endAbs);
+
+      if (from === to) {
+        continue;
+      }
+
+      const isActive = comment.id === activeCommentId;
+      const classNames = ['tiptap-comment-mark'];
+
+      if (isActive) {
+        classNames.push('tiptap-comment-mark-selected');
+      }
+
+      decorations.push(
+        Decoration.inline(
+          from,
+          to,
+          {
+            class: classNames.join(' '),
+            'data-comment-id': comment.id,
+          },
+          { commentId: comment.id }
+        )
+      );
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[comments-plugin] failed to decode anchor',
+        comment.id,
+        error
+      );
+    }
+  }
+
+  if (decorations.length === 0) {
+    return DecorationSet.empty;
+  }
+
+  return DecorationSet.create(state.doc, decorations);
 }
 
-function relativePositionToBase64(relPos: Y.RelativePosition): string {
-  const encoded = Y.encodeRelativePosition(relPos);
-  let binary = '';
-  for (let i = 0; i < encoded.length; i += 1) {
-    binary += String.fromCharCode(encoded[i]);
+function createCommentsPlugin(
+  options: CommentsPluginOptions
+): Plugin<DecorationSet> {
+  function recreateWithFallback(
+    tr: Transaction,
+    oldDecorationSet: DecorationSet,
+    newState: EditorState
+  ): DecorationSet {
+    const currentComments = options.getComments();
+    const fresh = createDecorations({
+      state: newState,
+      comments: currentComments,
+      activeCommentId: options.getActiveCommentId(),
+    });
+
+    if (fresh === DecorationSet.empty && currentComments.length > 0) {
+      return oldDecorationSet.map(tr.mapping, newState.doc);
+    }
+
+    return fresh;
   }
-  return btoa(binary);
+
+  return new Plugin<DecorationSet>({
+    key: commentsPluginKey,
+    state: {
+      init(_, state) {
+        return createDecorations({
+          state,
+          comments: options.getComments(),
+          activeCommentId: options.getActiveCommentId(),
+        });
+      },
+      apply(
+        tr: Transaction,
+        oldDecorationSet: DecorationSet,
+        _oldState: EditorState,
+        newState: EditorState
+      ) {
+        const meta = tr.getMeta(commentsPluginKey);
+
+        if (!tr.docChanged && !meta) {
+          return oldDecorationSet;
+        }
+
+        return recreateWithFallback(tr, oldDecorationSet, newState);
+      },
+    },
+    props: {
+      decorations(state) {
+        return commentsPluginKey.getState(state) ?? null;
+      },
+      handleClick(view: EditorView, pos: number, event: MouseEvent): boolean {
+        const decoSet = commentsPluginKey.getState(view.state);
+        if (!decoSet) return false;
+
+        const found = decoSet.find(pos, pos);
+        if (found.length === 0) return false;
+
+        const deco = found[0];
+        if (!deco) return false;
+
+        const spec = deco.spec as { commentId?: string } | undefined;
+        const commentId = spec?.commentId;
+
+        if (!commentId || typeof commentId !== 'string') {
+          return false;
+        }
+
+        if (options.onCommentClick) {
+          options.onCommentClick(commentId);
+        }
+
+        // Триггер пересчёта подсветки для активного комментария
+        const tr = view.state.tr.setMeta(commentsPluginKey, {
+          type: 'active-comment-changed',
+          id: commentId,
+        });
+        view.dispatch(tr);
+
+        return true;
+      },
+    },
+  });
 }
+
+// Tiptap Extension-обёртка над ProseMirror Plugin
+const commentsHighlightExtension = Extension.create({
+  name: 'commentsHighlight',
+  addProseMirrorPlugins() {
+    return [
+      createCommentsPlugin({
+        getComments: () => comments.value,
+        getActiveCommentId: () => activeCommentId.value,
+        onCommentClick: (id: string) => {
+          // Обновление активного комментария при клике по подсветке
+          activeCommentId.value = id;
+        },
+      }),
+    ];
+  },
+});
 
 // --------------------
 // Tiptap Editor + Collaboration + CollaborationCaret
@@ -303,6 +589,7 @@ const editor = useEditor({
         color: currentUser.color,
       },
     }),
+    commentsHighlightExtension,
   ],
   editable: true,
   onCreate: ({ editor: ed }) => {
@@ -328,6 +615,10 @@ let awarenessChangeHandler:
 let commentsObserver: ((event: unknown, transaction: unknown) => void) | null =
   null;
 
+// --------------------
+// Жизненный цикл Vue
+// --------------------
+
 onMounted(() => {
   provider.on('status', (event: { status: string }) => {
     // eslint-disable-next-line no-console
@@ -350,6 +641,15 @@ onMounted(() => {
   // Подписка на изменения Y.Map с комментариями
   commentsObserver = (): void => {
     updateCommentsFromYjs();
+
+    // Дополнительно — сигнал плагину, что комментарии поменялись
+    const ed = editor.value;
+    if (ed) {
+      const tr = ed.state.tr.setMeta(commentsPluginKey, {
+        type: 'comments-updated',
+      });
+      ed.view.dispatch(tr);
+    }
   };
   commentsMap.observe(commentsObserver);
 
@@ -374,6 +674,26 @@ onBeforeUnmount(() => {
 });
 
 // --------------------
+// Вспомогательная функция для доступа к YSyncState из редактора
+// --------------------
+
+function getYSyncStateFromEditor(): YSyncState | null {
+  const ed = editor.value;
+  if (!ed) return null;
+
+  const raw = ySyncPluginKey.getState(ed.state) as
+    | (YSyncState & { binding: YSyncBinding | null })
+    | null
+    | undefined;
+
+  if (!raw || !raw.doc || !raw.type || !raw.binding || !raw.binding.mapping) {
+    return null;
+  }
+
+  return raw as YSyncState;
+}
+
+// --------------------
 // Операции с комментариями — через Yjs-транзакции
 // --------------------
 
@@ -386,7 +706,7 @@ const addCommentFromSelection = (): void => {
 
   const { from, to, empty } = ed.state.selection;
 
-  // На шаге D комментарий добавляется только к непустому выделению
+  // На шаге F комментарий добавляется только к непустому выделению
   if (empty) {
     // eslint-disable-next-line no-console
     console.warn('[comments] selection is empty, comment not created');
@@ -504,5 +824,14 @@ const removeComment = (id: string): void => {
   color: #fff;
   white-space: nowrap;
   pointer-events: none;
+}
+:global(.tiptap-comment-mark) {
+  background-color: rgba(250, 204, 21, 0.25); /* мягкий жёлтый */
+  border-bottom: 1px dotted rgba(234, 179, 8, 0.9);
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.2);
+}
+:global(.tiptap-comment-mark-selected) {
+  background-color: rgba(250, 204, 21, 0.85);
 }
 </style>

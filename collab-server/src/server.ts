@@ -1,4 +1,5 @@
 import { Server } from '@hocuspocus/server';
+import type { onListenPayload } from '@hocuspocus/server';
 import { SQLite } from '@hocuspocus/extension-sqlite';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -13,9 +14,10 @@ const dbFile = path.join(dataDir, 'hocuspocus-dev.sqlite');
 const server = new Server({
   port,
   extensions: [new SQLite({ database: dbFile })],
-  onListen() {
+  onListen: async ({ port }: onListenPayload): Promise<void> => {
     // eslint-disable-next-line no-console
     console.log(`[hocuspocus] listening on ws://localhost:${port}`);
+    // eslint-disable-next-line no-console
     console.log(`[hocuspocus] sqlite file: ${dbFile}`);
   },
 });
