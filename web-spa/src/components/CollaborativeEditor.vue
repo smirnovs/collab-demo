@@ -12,7 +12,7 @@
           "
           @click="setEditorMode('edit')"
         >
-          Редактирование
+          Свободный режим
         </button>
         <button
           type="button"
@@ -24,7 +24,19 @@
           "
           @click="setEditorMode('propose')"
         >
-          Предложения
+          Предложения добавить текст или удалить текст
+        </button>
+        <button
+          type="button"
+          class="px-3 py-1 rounded border text-xs font-medium transition-colors"
+          :class="
+            isCommentOnly
+              ? 'bg-yellow-600 text-white border-blue-600'
+              : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+          "
+          @click="toggleOnlyComments"
+        >
+          Только комментирование
         </button>
       </div>
 
@@ -165,10 +177,17 @@
             :data-proposal-card-id="p.id"
             @click="focusProposalById(p.id)"
           >
-            <div class="text-xs text-gray-500 mb-1">Предложение изменения</div>
+            <div class="text-xs text-gray-500 mb-1">
+              Предложение {{ p.kind === 'insert' ? 'добавления' : 'удаления' }}
+            </div>
 
             <div class="text-sm font-medium">
               {{ p.authorName }}
+            </div>
+            <div
+              class="overflow-hidden line-clamp-3 break-words whitespace-normal"
+            >
+              {{ p.text }}
             </div>
 
             <div class="text-xs mt-1 text-gray-500">
@@ -266,11 +285,14 @@ interface commentData {
 }
 
 type proposedChangeStatus = 'pending' | 'approved';
+type proposedChangeKind = 'insert' | 'delete';
 
 interface proposedChangeData {
   id: string;
   authorName: string;
   status: proposedChangeStatus;
+  kind: proposedChangeKind;
+  text: string;
   anchor: commentAnchor;
 }
 
@@ -340,7 +362,8 @@ const proposedChangesMap: Y.Map<proposedChangeData> =
 // --------------------
 
 const proposedChanges = ref<proposedChangeData[]>([]);
-const editorMode = ref<'edit' | 'propose'>('edit'); // 'edit' = обычное поведение
+const editorMode = ref<'edit' | 'propose'>('edit');
+const isCommentOnly = ref<boolean>(false);
 const activeProposalId = ref<string | null>(null);
 
 const editorContentWrapper = ref<HTMLElement | null>(null);
@@ -455,6 +478,19 @@ function base64ToRelativePosition(encoded: string): Y.RelativePosition {
   }
 
   return Y.decodeRelativePosition(bytes);
+}
+
+function getDocTextRange(
+  doc: ProsemirrorNode,
+  from: number,
+  to: number
+): string {
+  if (from >= to) return '';
+  try {
+    return doc.textBetween(from, to, '\n');
+  } catch {
+    return '';
+  }
 }
 
 // --------------------
@@ -727,9 +763,13 @@ function handleEditorUpdate(params: {
     return;
   }
 
+  const ed = params.editor;
+  const doc = ed.state.doc as ProsemirrorNode;
+
   // Находим диапазон вставленного текста по шагам транзакции
   let insertionFrom: number | null = null;
   let insertionTo: number | null = null;
+  let hasReplaceLikeStep = false;
 
   tr.steps.forEach((step) => {
     const s = step as unknown as {
@@ -746,12 +786,14 @@ function handleEditorUpdate(params: {
       return;
     }
 
-    // Интересует только «чистая» вставка (from === to), без замены выделенного текста
+    // Если есть шаг вида "замена" (from !== to), трактуем всю транзакцию как replace
+    // и НЕ создаём proposal для вставки.
     if (s.from !== s.to) {
+      hasReplaceLikeStep = true;
       return;
     }
 
-    // ВАЖНО: assoc = -1, чтобы взять позицию СЛЕВА от вставки, а не справа
+    // Чистая вставка
     const mappedFrom = tr.mapping.map(s.from, -1);
     const start = mappedFrom;
     const end = mappedFrom + s.slice.size;
@@ -763,6 +805,11 @@ function handleEditorUpdate(params: {
       insertionTo = end;
     }
   });
+
+  // Ввод по выделенному тексту / сложная замена — пропускается
+  if (hasReplaceLikeStep) {
+    return;
+  }
 
   if (
     insertionFrom === null ||
@@ -793,6 +840,8 @@ function handleEditorUpdate(params: {
     return;
   }
 
+  const newTextFull = getDocTextRange(doc, startNew, endNew);
+
   ydoc.transact(() => {
     let reusedExisting = false;
     const currentId = activeProposalId.value;
@@ -800,7 +849,11 @@ function handleEditorUpdate(params: {
     // Попытка расширить текущий активный proposal, если вставка попадает внутрь него
     if (currentId) {
       const existing = proposedChangesMap.get(currentId);
-      if (existing && existing.status === 'pending') {
+      if (
+        existing &&
+        existing.status === 'pending' &&
+        existing.kind === 'insert'
+      ) {
         try {
           const existingStartRel = base64ToRelativePosition(
             existing.anchor.start
@@ -843,9 +896,12 @@ function handleEditorUpdate(params: {
               ),
             };
 
+            const mergedText = getDocTextRange(doc, existingStartAbs, endNew);
+
             const updated: proposedChangeData = {
               ...existing,
               anchor: newAnchor,
+              text: mergedText,
             };
 
             proposedChangesMap.set(currentId, updated);
@@ -878,6 +934,8 @@ function handleEditorUpdate(params: {
         id,
         authorName: currentUser.name,
         status: 'pending',
+        kind: 'insert',
+        text: newTextFull,
         anchor,
       };
 
@@ -886,13 +944,243 @@ function handleEditorUpdate(params: {
     }
   });
 
-  const ed = editor.value;
-  if (ed) {
-    const metaTr = ed.state.tr.setMeta(proposedPluginKey, {
+  const edInstance = editor.value;
+  if (edInstance) {
+    const metaTr = edInstance.state.tr.setMeta(proposedPluginKey, {
       type: 'proposals-updated',
     });
-    ed.view.dispatch(metaTr);
+    edInstance.view.dispatch(metaTr);
   }
+}
+
+function handleCutKey(ed: TiptapEditor): boolean {
+  if (editorMode.value !== 'propose') {
+    return false;
+  }
+
+  const { state } = ed;
+  const { from, to, empty } = state.selection;
+
+  // Нет выделения — режиссировать нечего, даём типтапу жить своей жизнью
+  if (empty) {
+    return false;
+  }
+
+  const created = createDeletionProposal(from, to, ed);
+  if (!created) return false;
+
+  // Оставляем выделение на помеченном диапазоне
+  ed.chain().setTextSelection({ from, to }).run();
+
+  // true: блокируем реальный cut (текст остаётся в документе, только подсветка)
+  return true;
+}
+
+function handleDeleteKey(
+  ed: TiptapEditor,
+  direction: 'backward' | 'forward'
+): boolean {
+  if (editorMode.value !== 'propose') {
+    return false;
+  }
+
+  const { state } = ed;
+  const { from, to, empty } = state.selection;
+
+  // 1) Если уже есть выделенный диапазон — помечаем его как "предложение удаления".
+  //    Курсор и выделение остаются как есть (поведение, о котором договаривались ранее).
+  if (!empty) {
+    const created = createDeletionProposal(from, to, ed);
+    if (!created) return false;
+
+    ed.chain().setTextSelection({ from, to }).run();
+    return true;
+  }
+
+  // 2) Если выделения нет — работаем по одной букве.
+  //    Буква НЕ выделяется, только подсвечивается, а декоратор растягивается
+  //    при последующих нажатиях Backspace/Delete.
+  const docSize = state.doc.content.size;
+  let start: number;
+  let end: number;
+
+  if (direction === 'backward') {
+    if (from <= 1) {
+      return false;
+    }
+    start = from - 1;
+    end = from;
+  } else {
+    if (from >= docSize) {
+      return false;
+    }
+    start = from;
+    end = from + 1;
+  }
+
+  const created = createDeletionProposal(start, end, ed);
+  if (!created) return false;
+
+  const collapsePos = direction === 'backward' ? start : end;
+
+  // Курсор двигается, но выделения нет (selection пустой),
+  // подсветка управляется исключительно декорациями.
+  ed.chain().setTextSelection(collapsePos).run();
+
+  return true;
+}
+
+function createDeletionProposal(
+  from: number,
+  to: number,
+  ed: TiptapEditor
+): boolean {
+  if (from >= to) return false;
+
+  const yState = getYSyncStateFromEditor();
+  if (!yState) {
+    // eslint-disable-next-line no-console
+    console.warn('[proposed-delete] ySync state is not available');
+    return false;
+  }
+
+  const doc = ed.state.doc as ProsemirrorNode;
+
+  const startAbs = from;
+  const endAbs = to;
+
+  ydoc.transact(() => {
+    let merged = false;
+    const currentId = activeProposalId.value;
+
+    if (currentId) {
+      const existing = proposedChangesMap.get(currentId);
+      if (
+        existing &&
+        existing.status === 'pending' &&
+        existing.kind === 'delete'
+      ) {
+        try {
+          const existingStartRel = base64ToRelativePosition(
+            existing.anchor.start
+          );
+          const existingEndRel = base64ToRelativePosition(existing.anchor.end);
+
+          const existingStartAbs = relativePositionToAbsolutePosition(
+            yState.doc,
+            yState.type,
+            existingStartRel,
+            yState.binding.mapping
+          );
+          const existingEndAbs = relativePositionToAbsolutePosition(
+            yState.doc,
+            yState.type,
+            existingEndRel,
+            yState.binding.mapping
+          );
+
+          if (existingStartAbs !== null && existingEndAbs !== null) {
+            const newStart = Math.min(existingStartAbs, startAbs);
+            const newEnd = Math.max(existingEndAbs, endAbs);
+
+            // Мержим только если диапазоны пересекаются или соседствуют
+            const areAdjacentOrOverlap =
+              endAbs >= existingStartAbs - 1 && startAbs <= existingEndAbs + 1;
+
+            if (areAdjacentOrOverlap) {
+              const newStartRel = absolutePositionToRelativePosition(
+                newStart,
+                yState.type,
+                yState.binding.mapping
+              );
+              const newEndRel = absolutePositionToRelativePosition(
+                newEnd,
+                yState.type,
+                yState.binding.mapping
+              );
+
+              if (newStartRel && newEndRel) {
+                const newAnchor: commentAnchor = {
+                  start: relativePositionToBase64(newStartRel),
+                  end: relativePositionToBase64(newEndRel),
+                };
+
+                const newText = getDocTextRange(doc, newStart, newEnd);
+
+                const updated: proposedChangeData = {
+                  ...existing,
+                  anchor: newAnchor,
+                  text: newText,
+                };
+
+                proposedChangesMap.set(currentId, updated);
+                merged = true;
+              }
+            }
+          }
+        } catch (error) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            '[proposed-delete] failed to merge deletion proposal',
+            currentId,
+            error
+          );
+        }
+      }
+    }
+
+    if (!merged) {
+      const startRel = absolutePositionToRelativePosition(
+        startAbs,
+        yState.type,
+        yState.binding.mapping
+      );
+      const endRel = absolutePositionToRelativePosition(
+        endAbs,
+        yState.type,
+        yState.binding.mapping
+      );
+
+      if (!startRel || !endRel) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[proposed-delete] failed to create relative positions for range'
+        );
+        return;
+      }
+
+      const anchor: commentAnchor = {
+        start: relativePositionToBase64(startRel),
+        end: relativePositionToBase64(endRel),
+      };
+
+      const text = getDocTextRange(doc, startAbs, endAbs);
+
+      const id =
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID()
+          : String(Date.now());
+
+      const change: proposedChangeData = {
+        id,
+        authorName: currentUser.name,
+        status: 'pending',
+        kind: 'delete',
+        text,
+        anchor,
+      };
+
+      proposedChangesMap.set(id, change);
+      activeProposalId.value = id;
+    }
+  });
+
+  const tr = ed.state.tr.setMeta(proposedPluginKey, {
+    type: 'proposals-updated',
+  });
+  ed.view.dispatch(tr);
+
+  return true;
 }
 
 function createCommentsPlugin(
@@ -999,7 +1287,7 @@ function createProposedDecorations(params: {
   state: EditorState;
   changes: proposedChangeData[];
   activeProposalId: string | null;
-}) {
+}): DecorationSet {
   const { state, changes, activeProposalId } = params;
 
   const raw = ySyncPluginKey.getState(state) as
@@ -1046,8 +1334,14 @@ function createProposedDecorations(params: {
       }
 
       const classNames = ['tiptap-proposed-mark'];
-      const isActive = change.id === activeProposalId;
 
+      if (change.kind === 'delete') {
+        classNames.push('tiptap-proposed-mark-delete');
+      } else {
+        classNames.push('tiptap-proposed-mark-insert');
+      }
+
+      const isActive = change.id === activeProposalId;
       if (isActive) {
         classNames.push('tiptap-proposed-mark-selected');
       }
@@ -1161,6 +1455,195 @@ const proposedHighlightExtension = Extension.create({
   },
 });
 
+const blockInsertInDeleteExtension = Extension.create({
+  name: 'blockInsertInDelete',
+  addProseMirrorPlugins() {
+    return [
+      new Plugin({
+        key: new PluginKey('block-insert-in-delete'),
+        filterTransaction(tr: Transaction, state: EditorState): boolean {
+          // Разрешаем всё, если:
+          // - не режим предложений
+          // - транзакция не меняет документ
+          if (editorMode.value !== 'propose') {
+            return true;
+          }
+
+          if (!tr.docChanged) {
+            return true;
+          }
+
+          const selection = state.selection;
+
+          // Проверяем, есть ли в транзакции вставка текста вообще
+          let hasInsertion = false;
+
+          tr.steps.forEach((step) => {
+            const s = step as unknown as {
+              from?: number;
+              slice?: { size: number };
+            };
+
+            if (!s.slice || typeof s.slice.size !== 'number') {
+              return;
+            }
+
+            if (s.slice.size > 0) {
+              hasInsertion = true;
+            }
+          });
+
+          // 1) Если есть выделение И есть вставка — блокируем печать/вставку.
+          // Это запрещает ввод текста поверх выделенного диапазона в режиме propose.
+          if (!selection.empty && hasInsertion) {
+            return false;
+          }
+
+          const raw = ySyncPluginKey.getState(state) as
+            | (YSyncState & { binding: YSyncBinding | null })
+            | null
+            | undefined;
+
+          if (
+            !raw ||
+            !raw.doc ||
+            !raw.type ||
+            !raw.binding ||
+            !raw.binding.mapping
+          ) {
+            return true;
+          }
+
+          const yState = raw as YSyncState;
+
+          // 2) Собираем все pending delete-диапазоны в абсолютных координатах
+          const deleteRanges: { from: number; to: number }[] = [];
+
+          for (const change of proposedChanges.value) {
+            if (change.status !== 'pending' || change.kind !== 'delete') {
+              continue;
+            }
+
+            try {
+              const startRel = base64ToRelativePosition(change.anchor.start);
+              const endRel = base64ToRelativePosition(change.anchor.end);
+
+              const startAbs = relativePositionToAbsolutePosition(
+                yState.doc,
+                yState.type,
+                startRel,
+                yState.binding.mapping
+              );
+              const endAbs = relativePositionToAbsolutePosition(
+                yState.doc,
+                yState.type,
+                endRel,
+                yState.binding.mapping
+              );
+
+              if (startAbs === null || endAbs === null) {
+                continue;
+              }
+
+              const from = Math.min(startAbs, endAbs);
+              const to = Math.max(startAbs, endAbs);
+
+              if (from === to) continue;
+
+              deleteRanges.push({ from, to });
+            } catch {
+              // игнорируем битые анкеры
+            }
+          }
+
+          if (deleteRanges.length === 0 || !hasInsertion) {
+            return true;
+          }
+
+          // 3) Проверяем шаги транзакции: если вставка пересекает delete-диапазон — блокируем
+          let blocked = false;
+
+          tr.steps.forEach((step) => {
+            if (blocked) return;
+
+            const s = step as unknown as {
+              from?: number;
+              slice?: { size: number };
+            };
+
+            if (
+              !s.slice ||
+              typeof s.slice.size !== 'number' ||
+              s.slice.size === 0
+            ) {
+              return;
+            }
+
+            if (typeof s.from !== 'number') {
+              return;
+            }
+
+            const mappedFrom = tr.mapping.map(s.from, 1);
+            const insFrom = mappedFrom;
+            const insTo = mappedFrom + s.slice.size;
+
+            for (const r of deleteRanges) {
+              // Пересечение диапазонов вставки и delete-диапазона
+              if (insFrom < r.to && insTo > r.from) {
+                blocked = true;
+                break;
+              }
+            }
+          });
+
+          return !blocked;
+        },
+      }),
+    ];
+  },
+});
+
+const proposedDeletionExtension = Extension.create({
+  name: 'proposedDeletion',
+  addKeyboardShortcuts() {
+    return {
+      Backspace: () => handleDeleteKey(this.editor, 'backward'),
+      Delete: () => handleDeleteKey(this.editor, 'forward'),
+      'Mod-x': () => handleCutKey(this.editor),
+      Enter: () => {
+        if (editorMode.value !== 'propose') {
+          return false;
+        }
+
+        const { empty } = this.editor.state.selection;
+
+        // Если есть выделение — блокируем Enter, чтобы не было замены текста
+        if (!empty) {
+          return true;
+        }
+
+        // Без выделения пусть Enter работает как обычно
+        return false;
+      },
+      'Mod-v': () => {
+        if (editorMode.value !== 'propose') {
+          return false;
+        }
+
+        const { empty } = this.editor.state.selection;
+
+        // Если есть выделение — блокируем Ctrl+V, чтобы не было замены текста
+        if (!empty) {
+          return true;
+        }
+
+        // Без выделения вставка разрешена
+        return false;
+      },
+    };
+  },
+});
+
 // --------------------
 // Tiptap Editor + Collaboration + CollaborationCaret
 // --------------------
@@ -1168,7 +1651,6 @@ const proposedHighlightExtension = Extension.create({
 const editor = useEditor({
   extensions: [
     StarterKit.configure({
-      // важно: именно undoRedo, а не history
       undoRedo: false,
     }),
     Collaboration.configure({
@@ -1183,8 +1665,10 @@ const editor = useEditor({
     }),
     commentsHighlightExtension,
     proposedHighlightExtension,
+    proposedDeletionExtension,
+    blockInsertInDeleteExtension,
   ],
-  editable: true,
+  editable: !isCommentOnly.value,
   onCreate: ({ editor: ed }) => {
     // eslint-disable-next-line no-console
     console.log('[tiptap] editor created', ed.state.doc.toJSON());
@@ -1193,13 +1677,12 @@ const editor = useEditor({
   onSelectionUpdate: handleSelectionUpdate,
 });
 
-const addText = ref<string>('');
+const toggleOnlyComments = () => {
+  isCommentOnly.value = !isCommentOnly.value;
+  editor.value?.setEditable(!isCommentOnly.value);
+};
 
-const canAdd = computed<boolean>(() => {
-  const textFilled = addText.value.trim().length > 0;
-  // На этом шаге блокируется только пустой текст; проверка выделения — внутри addCommentFromSelection
-  return textFilled && !!editor.value;
-});
+const addText = ref<string>('');
 
 let awarenessChangeHandler:
   | ((payload: {
@@ -1393,11 +1876,48 @@ function handleAddCommentFromPopup(): void {
 }
 
 const approveProposedChange = (id: string): void => {
-  const existing = proposedChangesMap.get(id);
-  if (!existing) return;
+  const change = proposedChangesMap.get(id);
+  if (!change) return;
+
+  const ed = editor.value;
+
+  // Для kind === 'delete' по "Принять" удаляем текст из документа,
+  // но карточку оставляем (меняется только статус).
+  if (ed && change.kind === 'delete') {
+    const yState = getYSyncStateFromEditor();
+    if (yState) {
+      try {
+        const startRel = base64ToRelativePosition(change.anchor.start);
+        const endRel = base64ToRelativePosition(change.anchor.end);
+
+        const startAbs = relativePositionToAbsolutePosition(
+          yState.doc,
+          yState.type,
+          startRel,
+          yState.binding.mapping
+        );
+        const endAbs = relativePositionToAbsolutePosition(
+          yState.doc,
+          yState.type,
+          endRel,
+          yState.binding.mapping
+        );
+
+        if (startAbs !== null && endAbs !== null && startAbs !== endAbs) {
+          const from = Math.min(startAbs, endAbs);
+          const to = Math.max(startAbs, endAbs);
+
+          ed.chain().focus().deleteRange({ from, to }).run();
+        }
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.warn('[proposed] failed to apply delete on approve', id, error);
+      }
+    }
+  }
 
   const updated: proposedChangeData = {
-    ...existing,
+    ...change,
     status: 'approved',
   };
 
@@ -1412,41 +1932,48 @@ const approveProposedChange = (id: string): void => {
 
 const deleteProposedChange = (id: string): void => {
   const ed = editor.value;
-  if (!ed) return;
-
   const change = proposedChangesMap.get(id);
   if (!change) return;
 
-  const yState = getYSyncStateFromEditor();
-  if (!yState) return;
+  // Для pending + kind === 'insert' "Удалить" ведёт себя как раньше:
+  // реально убирает вставленный диапазон из документа.
+  // Для kind === 'delete' текст НЕ трогаем, только карточку.
+  // Для любых approved-предложений — тоже только удаляем карточку.
+  if (ed && change.status === 'pending' && change.kind === 'insert') {
+    const yState = getYSyncStateFromEditor();
+    if (yState) {
+      try {
+        const startRel = base64ToRelativePosition(change.anchor.start);
+        const endRel = base64ToRelativePosition(change.anchor.end);
 
-  try {
-    const startRel = base64ToRelativePosition(change.anchor.start);
-    const endRel = base64ToRelativePosition(change.anchor.end);
+        const startAbs = relativePositionToAbsolutePosition(
+          yState.doc,
+          yState.type,
+          startRel,
+          yState.binding.mapping
+        );
+        const endAbs = relativePositionToAbsolutePosition(
+          yState.doc,
+          yState.type,
+          endRel,
+          yState.binding.mapping
+        );
 
-    const startAbs = relativePositionToAbsolutePosition(
-      yState.doc,
-      yState.type,
-      startRel,
-      yState.binding.mapping
-    );
-    const endAbs = relativePositionToAbsolutePosition(
-      yState.doc,
-      yState.type,
-      endRel,
-      yState.binding.mapping
-    );
+        if (startAbs !== null && endAbs !== null && startAbs !== endAbs) {
+          const from = Math.min(startAbs, endAbs);
+          const to = Math.max(startAbs, endAbs);
 
-    if (startAbs !== null && endAbs !== null && startAbs !== endAbs) {
-      const from = Math.min(startAbs, endAbs);
-      const to = Math.max(startAbs, endAbs);
-
-      // Удаление текста из документа через Tiptap → синхронизация через y-sync
-      ed.chain().focus().deleteRange({ from, to }).run();
+          ed.chain().focus().deleteRange({ from, to }).run();
+        }
+      } catch (error) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          '[proposed] failed to delete range for insert proposal',
+          id,
+          error
+        );
+      }
     }
-  } catch (error) {
-    // eslint-disable-next-line no-console
-    console.warn('[proposed] failed to delete range for proposal', id, error);
   }
 
   ydoc.transact(() => {
@@ -1480,7 +2007,9 @@ const removeComment = (id: string): void => {
 </script>
 
 <style scoped>
-/* Кастомный курсор других пользователей */
+:global(.ProseMirror-focused) {
+  border: none;
+}
 :global(.tiptap .collaboration-carets__caret) {
   position: relative;
   border-left-width: 0;
@@ -1535,5 +2064,14 @@ const removeComment = (id: string): void => {
 
 .selection-popup {
   transform: translate(-50%, -100%);
+}
+
+:global(.tiptap-proposed-mark-delete) {
+  background-color: rgba(220, 38, 38, 0.18);
+  border-bottom: 1px solid rgba(220, 38, 38, 0.85);
+}
+
+:global(.tiptap-proposed-mark-selected.tiptap-proposed-mark-delete) {
+  background-color: rgba(220, 38, 38, 0.35);
 }
 </style>
