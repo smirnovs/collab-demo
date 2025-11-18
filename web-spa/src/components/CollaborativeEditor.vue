@@ -178,7 +178,15 @@
             @click="focusProposalById(p.id)"
           >
             <div class="text-xs text-gray-500 mb-1">
-              Предложение {{ p.kind === 'insert' ? 'добавления' : 'удаления' }}
+              Предложение
+              <span
+                class="font-medium"
+                :class="{
+                  'text-orange-600': p.kind === 'delete',
+                  'text-green-600': p.kind === 'insert',
+                }"
+                >{{ p.kind === 'insert' ? 'добавления' : 'удаления' }}</span
+              >
             </div>
 
             <div class="text-sm font-medium">
@@ -493,6 +501,40 @@ function getDocTextRange(
   }
 }
 
+function resolveAnchorRange(
+  anchor: commentAnchor,
+  yState: YSyncState
+): { from: number; to: number } | null {
+  try {
+    const startRel = base64ToRelativePosition(anchor.start);
+    const endRel = base64ToRelativePosition(anchor.end);
+
+    const startAbs = relativePositionToAbsolutePosition(
+      yState.doc,
+      yState.type,
+      startRel,
+      yState.binding.mapping
+    );
+    const endAbs = relativePositionToAbsolutePosition(
+      yState.doc,
+      yState.type,
+      endRel,
+      yState.binding.mapping
+    );
+
+    if (startAbs === null || endAbs === null || startAbs === endAbs) {
+      return null;
+    }
+
+    return {
+      from: Math.min(startAbs, endAbs),
+      to: Math.max(startAbs, endAbs),
+    };
+  } catch {
+    return null;
+  }
+}
+
 // --------------------
 // ProseMirror Plugin для подсветки диапазонов комментариев
 // --------------------
@@ -512,28 +554,10 @@ function focusProposalById(id: string): void {
   if (!yState) return;
 
   try {
-    const startRel = base64ToRelativePosition(proposal.anchor.start);
-    const endRel = base64ToRelativePosition(proposal.anchor.end);
+    const range = resolveAnchorRange(proposal.anchor, yState);
+    if (!range) return;
 
-    const startAbs = relativePositionToAbsolutePosition(
-      yState.doc,
-      yState.type,
-      startRel,
-      yState.binding.mapping
-    );
-    const endAbs = relativePositionToAbsolutePosition(
-      yState.doc,
-      yState.type,
-      endRel,
-      yState.binding.mapping
-    );
-
-    if (startAbs === null || endAbs === null) return;
-
-    const from = Math.min(startAbs, endAbs);
-    const to = Math.max(startAbs, endAbs);
-    if (from === to) return;
-
+    const { from, to } = range;
     ed.view.focus();
 
     const domPos = ed.view.domAtPos(from);
@@ -573,28 +597,10 @@ function focusCommentById(id: string): void {
   if (!yState) return;
 
   try {
-    const startRel = base64ToRelativePosition(comment.anchor.start);
-    const endRel = base64ToRelativePosition(comment.anchor.end);
+    const range = resolveAnchorRange(comment.anchor, yState);
+    if (!range) return;
 
-    const startAbs = relativePositionToAbsolutePosition(
-      yState.doc,
-      yState.type,
-      startRel,
-      yState.binding.mapping
-    );
-    const endAbs = relativePositionToAbsolutePosition(
-      yState.doc,
-      yState.type,
-      endRel,
-      yState.binding.mapping
-    );
-
-    if (startAbs === null || endAbs === null) return;
-
-    const from = Math.min(startAbs, endAbs);
-    const to = Math.max(startAbs, endAbs);
-    if (from === to) return;
-
+    const { from, to } = range;
     // Фокус на редакторе, но БЕЗ изменения selection
     ed.view.focus();
 
@@ -648,33 +654,12 @@ function createDecorations(params: {
     if (comment.resolved) continue;
 
     try {
-      const startRel = base64ToRelativePosition(comment.anchor.start);
-      const endRel = base64ToRelativePosition(comment.anchor.end);
-
-      const startAbs = relativePositionToAbsolutePosition(
-        yState.doc,
-        yState.type,
-        startRel,
-        yState.binding.mapping
-      );
-      const endAbs = relativePositionToAbsolutePosition(
-        yState.doc,
-        yState.type,
-        endRel,
-        yState.binding.mapping
-      );
-
-      if (startAbs === null || endAbs === null) {
+      const range = resolveAnchorRange(comment.anchor, yState);
+      if (!range) {
         continue;
       }
 
-      const from = Math.min(startAbs, endAbs);
-      const to = Math.max(startAbs, endAbs);
-
-      if (from === to) {
-        continue;
-      }
-
+      const { from, to } = range;
       const isActive = comment.id === activeCommentId;
       const classNames = ['tiptap-comment-mark'];
 
@@ -693,13 +678,8 @@ function createDecorations(params: {
           { commentId: comment.id }
         )
       );
-    } catch (error) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        '[comments-plugin] failed to decode anchor',
-        comment.id,
-        error
-      );
+    } catch {
+      // игнорируем битые анкеры
     }
   }
 
@@ -855,34 +835,16 @@ function handleEditorUpdate(params: {
         existing.kind === 'insert'
       ) {
         try {
-          const existingStartRel = base64ToRelativePosition(
-            existing.anchor.start
-          );
-          const existingEndRel = base64ToRelativePosition(existing.anchor.end);
-
-          const existingStartAbs = relativePositionToAbsolutePosition(
-            yState.doc,
-            yState.type,
-            existingStartRel,
-            yState.binding.mapping
-          );
-          const existingEndAbs = relativePositionToAbsolutePosition(
-            yState.doc,
-            yState.type,
-            existingEndRel,
-            yState.binding.mapping
-          );
-
+          const existingRange = resolveAnchorRange(existing.anchor, yState);
           if (
-            existingStartAbs !== null &&
-            existingEndAbs !== null &&
-            startNew >= existingStartAbs &&
-            startNew <= existingEndAbs
+            existingRange &&
+            startNew >= existingRange.from &&
+            startNew <= existingRange.to
           ) {
             const newAnchor: commentAnchor = {
               start: relativePositionToBase64(
                 absolutePositionToRelativePosition(
-                  existingStartAbs,
+                  existingRange.from,
                   yState.type,
                   yState.binding.mapping
                 ) as Y.RelativePosition
@@ -896,7 +858,7 @@ function handleEditorUpdate(params: {
               ),
             };
 
-            const mergedText = getDocTextRange(doc, existingStartAbs, endNew);
+            const mergedText = getDocTextRange(doc, existingRange.from, endNew);
 
             const updated: proposedChangeData = {
               ...existing,
@@ -1061,31 +1023,15 @@ function createDeletionProposal(
         existing.kind === 'delete'
       ) {
         try {
-          const existingStartRel = base64ToRelativePosition(
-            existing.anchor.start
-          );
-          const existingEndRel = base64ToRelativePosition(existing.anchor.end);
-
-          const existingStartAbs = relativePositionToAbsolutePosition(
-            yState.doc,
-            yState.type,
-            existingStartRel,
-            yState.binding.mapping
-          );
-          const existingEndAbs = relativePositionToAbsolutePosition(
-            yState.doc,
-            yState.type,
-            existingEndRel,
-            yState.binding.mapping
-          );
-
-          if (existingStartAbs !== null && existingEndAbs !== null) {
-            const newStart = Math.min(existingStartAbs, startAbs);
-            const newEnd = Math.max(existingEndAbs, endAbs);
+          const existingRange = resolveAnchorRange(existing.anchor, yState);
+          if (existingRange) {
+            const newStart = Math.min(existingRange.from, startAbs);
+            const newEnd = Math.max(existingRange.to, endAbs);
 
             // Мержим только если диапазоны пересекаются или соседствуют
             const areAdjacentOrOverlap =
-              endAbs >= existingStartAbs - 1 && startAbs <= existingEndAbs + 1;
+              endAbs >= existingRange.from - 1 &&
+              startAbs <= existingRange.to + 1;
 
             if (areAdjacentOrOverlap) {
               const newStartRel = absolutePositionToRelativePosition(
@@ -1305,34 +1251,12 @@ function createProposedDecorations(params: {
   for (const change of changes) {
     if (change.status !== 'pending') continue;
 
-    try {
-      const startRel = base64ToRelativePosition(change.anchor.start);
-      const endRel = base64ToRelativePosition(change.anchor.end);
+    const range = resolveAnchorRange(change.anchor, yState);
+    if (!range) {
+      continue;
+    }
 
-      const startAbs = relativePositionToAbsolutePosition(
-        yState.doc,
-        yState.type,
-        startRel,
-        yState.binding.mapping
-      );
-      const endAbs = relativePositionToAbsolutePosition(
-        yState.doc,
-        yState.type,
-        endRel,
-        yState.binding.mapping
-      );
-
-      if (startAbs === null || endAbs === null) {
-        continue;
-      }
-
-      const from = Math.min(startAbs, endAbs);
-      const to = Math.max(startAbs, endAbs);
-
-      if (from === to) {
-        continue;
-      }
-
+    const { from, to } = range;
       const classNames = ['tiptap-proposed-mark'];
 
       if (change.kind === 'delete') {
@@ -1357,14 +1281,6 @@ function createProposedDecorations(params: {
           { proposalId: change.id }
         )
       );
-    } catch (error) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        '[proposed-plugin] failed to decode anchor',
-        change.id,
-        error
-      );
-    }
   }
 
   if (decorations.length === 0) {
@@ -1524,36 +1440,12 @@ const blockInsertInDeleteExtension = Extension.create({
               continue;
             }
 
-            try {
-              const startRel = base64ToRelativePosition(change.anchor.start);
-              const endRel = base64ToRelativePosition(change.anchor.end);
-
-              const startAbs = relativePositionToAbsolutePosition(
-                yState.doc,
-                yState.type,
-                startRel,
-                yState.binding.mapping
-              );
-              const endAbs = relativePositionToAbsolutePosition(
-                yState.doc,
-                yState.type,
-                endRel,
-                yState.binding.mapping
-              );
-
-              if (startAbs === null || endAbs === null) {
-                continue;
-              }
-
-              const from = Math.min(startAbs, endAbs);
-              const to = Math.max(startAbs, endAbs);
-
-              if (from === to) continue;
-
-              deleteRanges.push({ from, to });
-            } catch {
-              // игнорируем битые анкеры
+            const range = resolveAnchorRange(change.anchor, yState);
+            if (!range) {
+              continue;
             }
+
+            deleteRanges.push(range);
           }
 
           if (deleteRanges.length === 0 || !hasInsertion) {
@@ -1886,32 +1778,18 @@ const approveProposedChange = (id: string): void => {
   if (ed && change.kind === 'delete') {
     const yState = getYSyncStateFromEditor();
     if (yState) {
-      try {
-        const startRel = base64ToRelativePosition(change.anchor.start);
-        const endRel = base64ToRelativePosition(change.anchor.end);
-
-        const startAbs = relativePositionToAbsolutePosition(
-          yState.doc,
-          yState.type,
-          startRel,
-          yState.binding.mapping
-        );
-        const endAbs = relativePositionToAbsolutePosition(
-          yState.doc,
-          yState.type,
-          endRel,
-          yState.binding.mapping
-        );
-
-        if (startAbs !== null && endAbs !== null && startAbs !== endAbs) {
-          const from = Math.min(startAbs, endAbs);
-          const to = Math.max(startAbs, endAbs);
-
-          ed.chain().focus().deleteRange({ from, to }).run();
+      const range = resolveAnchorRange(change.anchor, yState);
+      if (range) {
+        try {
+          ed.chain().focus().deleteRange(range).run();
+        } catch (error) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            '[proposed] failed to apply delete on approve',
+            id,
+            error
+          );
         }
-      } catch (error) {
-        // eslint-disable-next-line no-console
-        console.warn('[proposed] failed to apply delete on approve', id, error);
       }
     }
   }
@@ -1942,36 +1820,18 @@ const deleteProposedChange = (id: string): void => {
   if (ed && change.status === 'pending' && change.kind === 'insert') {
     const yState = getYSyncStateFromEditor();
     if (yState) {
-      try {
-        const startRel = base64ToRelativePosition(change.anchor.start);
-        const endRel = base64ToRelativePosition(change.anchor.end);
-
-        const startAbs = relativePositionToAbsolutePosition(
-          yState.doc,
-          yState.type,
-          startRel,
-          yState.binding.mapping
-        );
-        const endAbs = relativePositionToAbsolutePosition(
-          yState.doc,
-          yState.type,
-          endRel,
-          yState.binding.mapping
-        );
-
-        if (startAbs !== null && endAbs !== null && startAbs !== endAbs) {
-          const from = Math.min(startAbs, endAbs);
-          const to = Math.max(startAbs, endAbs);
-
-          ed.chain().focus().deleteRange({ from, to }).run();
+      const range = resolveAnchorRange(change.anchor, yState);
+      if (range) {
+        try {
+          ed.chain().focus().deleteRange(range).run();
+        } catch (error) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            '[proposed] failed to delete range for insert proposal',
+            id,
+            error
+          );
         }
-      } catch (error) {
-        // eslint-disable-next-line no-console
-        console.warn(
-          '[proposed] failed to delete range for insert proposal',
-          id,
-          error
-        );
       }
     }
   }
