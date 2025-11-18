@@ -1,6 +1,33 @@
 <template>
   <div class="container mx-auto max-w-6xl p-6 flex gap-4">
     <div class="flex-1">
+      <div class="flex gap-2 mb-3">
+        <button
+          type="button"
+          class="px-3 py-1 rounded border text-xs font-medium transition-colors"
+          :class="
+            editorMode === 'edit'
+              ? 'bg-blue-600 text-white border-blue-600'
+              : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+          "
+          @click="setEditorMode('edit')"
+        >
+          Редактирование
+        </button>
+        <button
+          type="button"
+          class="px-3 py-1 rounded border text-xs font-medium transition-colors"
+          :class="
+            editorMode === 'propose'
+              ? 'bg-blue-600 text-white border-blue-600'
+              : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
+          "
+          @click="setEditorMode('propose')"
+        >
+          Предложения
+        </button>
+      </div>
+
       <!-- Онлайн-пользователи -->
       <div class="mb-3 flex items-center gap-2 text-xs text-gray-600">
         <span class="font-medium">Онлайн:</span>
@@ -29,16 +56,37 @@
       <div class="border rounded-lg bg-white">
         <div class="px-4 py-2 border-b flex items-center justify-between">
           <div class="font-medium">Совместный редактор</div>
-          <div class="text-sm text-gray-500">
-            Фаза C/D: общий текст + курсоры + общие комментарии (якоря по
-            выделению уже сохраняются, но ещё не подсвечиваются)
-          </div>
         </div>
 
-        <div class="p-4 min-h-[320px]">
+        <div ref="editorContentWrapper" class="p-4 min-h-[320px] relative">
           <EditorContent v-if="editor" :editor="editor" />
           <div v-else class="text-sm text-gray-500">
             Инициализация редактора…
+          </div>
+
+          <div
+            v-if="selectionPopup.visible"
+            class="absolute z-20 bg-white border rounded shadow px-3 py-2 text-xs max-w-xs selection-popup"
+            :style="{
+              top: selectionPopup.top + 'px',
+              left: selectionPopup.left + 'px',
+            }"
+          >
+            <div class="font-medium mb-1 text-[11px]">Добавить комментарий</div>
+            <input
+              v-model="selectionCommentText"
+              type="text"
+              class="border rounded px-2 py-1 text-xs w-full mb-2"
+              placeholder="Текст комментария…"
+            />
+            <button
+              type="button"
+              class="px-2 py-1 border rounded bg-blue-600 text-white text-xs disabled:opacity-50"
+              :disabled="!selectionCommentText.trim()"
+              @click="handleAddCommentFromPopup"
+            >
+              Добавить
+            </button>
           </div>
         </div>
 
@@ -52,34 +100,12 @@
           <span>Текущий пользователь: {{ currentUser.name }}</span>
         </div>
       </div>
-
-      <div class="mt-4 flex items-center gap-2">
-        <input
-          v-model="addText"
-          type="text"
-          placeholder="Текст комментария…"
-          class="border rounded px-3 py-2 flex-1 bg-white"
-        />
-        <button
-          class="px-3 py-2 border rounded bg-blue-600 text-white disabled:opacity-50"
-          :disabled="!canAdd"
-          @click="addCommentFromSelection"
-        >
-          Комментировать выделение
-        </button>
-      </div>
-
-      <p class="text-sm text-gray-500 mt-1">
-        Фаза D: комментарии уже привязаны к выделению через RelativePosition в
-        Yjs, но подсветки внутри текста пока нет — появится на следующем шаге
-        через ProseMirror plugin.
-      </p>
     </div>
 
     <aside class="w-[340px] shrink-0">
       <div class="border rounded-lg bg-white">
         <div class="px-4 py-2 border-b font-medium">Комментарии (общие)</div>
-        <div class="max-h-[60vh] overflow-auto divide-y">
+        <div class="overflow-auto divide-y">
           <div
             v-for="c in comments"
             :key="c.id"
@@ -90,6 +116,7 @@
                 'bg-blue-100 ring-1 ring-blue-200': activeCommentId === c.id,
               },
             ]"
+            :data-comment-card-id="c.id"
             @click="focusCommentById(c.id)"
           >
             <div class="text-sm font-medium">
@@ -121,6 +148,65 @@
           </div>
         </div>
       </div>
+
+      <div class="border rounded-lg bg-white mt-4">
+        <div class="px-4 py-2 border-b font-medium">Предложения (общие)</div>
+        <div class="overflow-auto divide-y">
+          <div
+            v-for="p in proposedChanges"
+            :key="p.id"
+            class="p-3 hover:bg-gray-50 cursor-default"
+            :class="[
+              {
+                'opacity-60': p.status === 'approved',
+                'bg-blue-100 ring-1 ring-blue-200': activeProposalId === p.id,
+              },
+            ]"
+            :data-proposal-card-id="p.id"
+            @click="focusProposalById(p.id)"
+          >
+            <div class="text-xs text-gray-500 mb-1">Предложение изменения</div>
+
+            <div class="text-sm font-medium">
+              {{ p.authorName }}
+            </div>
+
+            <div class="text-xs mt-1 text-gray-500">
+              Статус:
+              <span
+                :class="
+                  p.status === 'pending' ? 'text-orange-600' : 'text-green-600'
+                "
+              >
+                {{ p.status === 'pending' ? 'в ожидании' : 'принято' }}
+              </span>
+            </div>
+
+            <div class="mt-2 flex items-center gap-2">
+              <button
+                v-if="p.status === 'pending'"
+                class="text-xs px-2 py-1 border rounded"
+                @click="approveProposedChange(p.id)"
+              >
+                Принять
+              </button>
+              <button
+                class="text-xs px-2 py-1 border rounded"
+                @click="deleteProposedChange(p.id)"
+              >
+                Удалить
+              </button>
+            </div>
+          </div>
+
+          <div
+            v-if="proposedChanges.length === 0"
+            class="p-3 text-sm text-gray-500"
+          >
+            Пока нет предложений.
+          </div>
+        </div>
+      </div>
     </aside>
   </div>
 </template>
@@ -148,6 +234,7 @@ import {
 import { Decoration, DecorationSet } from '@tiptap/pm/view';
 import type { EditorView } from '@tiptap/pm/view';
 import { Extension } from '@tiptap/core';
+import type { Editor as TiptapEditor } from '@tiptap/core';
 
 // --------------------
 // Типы
@@ -175,6 +262,15 @@ interface commentData {
   text: string;
   authorName: string;
   resolved: boolean;
+  anchor: commentAnchor;
+}
+
+type proposedChangeStatus = 'pending' | 'approved';
+
+interface proposedChangeData {
+  id: string;
+  authorName: string;
+  status: proposedChangeStatus;
   anchor: commentAnchor;
 }
 
@@ -235,6 +331,56 @@ const ydoc = provider.document as Y.Doc;
 
 // Y.Map для комментариев — единый источник правды
 const commentsMap: Y.Map<commentData> = ydoc.getMap<commentData>('comments');
+
+const proposedChangesMap: Y.Map<proposedChangeData> =
+  ydoc.getMap<proposedChangeData>('proposedChanges');
+
+// --------------------
+// Vue-реактивный список предложенных изменений + режим редактора
+// --------------------
+
+const proposedChanges = ref<proposedChangeData[]>([]);
+const editorMode = ref<'edit' | 'propose'>('edit'); // 'edit' = обычное поведение
+const activeProposalId = ref<string | null>(null);
+
+const editorContentWrapper = ref<HTMLElement | null>(null);
+
+const selectionPopup = ref<{
+  visible: boolean;
+  top: number;
+  left: number;
+}>({
+  visible: false,
+  top: 0,
+  left: 0,
+});
+
+const selectionCommentText = ref<string>('');
+
+function hideSelectionPopup(): void {
+  selectionPopup.value = {
+    visible: false,
+    top: 0,
+    left: 0,
+  };
+  selectionCommentText.value = '';
+}
+
+function updateProposedChangesFromYjs(): void {
+  const next: proposedChangeData[] = [];
+  proposedChangesMap.forEach((value) => {
+    next.push(value);
+  });
+  proposedChanges.value = next;
+}
+
+function setEditorMode(mode: 'edit' | 'propose'): void {
+  editorMode.value = mode;
+  // при переключении режима текущий активный proposal сбрасывается,
+  // чтобы новый ввод создавал новое предложение
+  activeProposalId.value = null;
+  hideSelectionPopup();
+}
 
 // --------------------
 // Vue-реактивный список онлайн-пользователей (awareness)
@@ -316,6 +462,67 @@ function base64ToRelativePosition(encoded: string): Y.RelativePosition {
 // --------------------
 
 const commentsPluginKey = new PluginKey<DecorationSet>('comments-plugin');
+
+function focusProposalById(id: string): void {
+  activeProposalId.value = id;
+
+  const ed = editor.value;
+  if (!ed) return;
+
+  const proposal = proposedChanges.value.find((p) => p.id === id);
+  if (!proposal) return;
+
+  const yState = getYSyncStateFromEditor();
+  if (!yState) return;
+
+  try {
+    const startRel = base64ToRelativePosition(proposal.anchor.start);
+    const endRel = base64ToRelativePosition(proposal.anchor.end);
+
+    const startAbs = relativePositionToAbsolutePosition(
+      yState.doc,
+      yState.type,
+      startRel,
+      yState.binding.mapping
+    );
+    const endAbs = relativePositionToAbsolutePosition(
+      yState.doc,
+      yState.type,
+      endRel,
+      yState.binding.mapping
+    );
+
+    if (startAbs === null || endAbs === null) return;
+
+    const from = Math.min(startAbs, endAbs);
+    const to = Math.max(startAbs, endAbs);
+    if (from === to) return;
+
+    ed.view.focus();
+
+    const domPos = ed.view.domAtPos(from);
+    let target: HTMLElement | null = null;
+
+    if (domPos.node.nodeType === Node.TEXT_NODE) {
+      target = domPos.node.parentElement;
+    } else if (domPos.node instanceof HTMLElement) {
+      target = domPos.node;
+    }
+
+    if (target) {
+      target.scrollIntoView({ block: 'center' });
+    }
+
+    const tr = ed.state.tr.setMeta(proposedPluginKey, {
+      type: 'active-proposal-changed',
+      id,
+    });
+    ed.view.dispatch(tr);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn('[proposed] failed to focus proposal', id, error);
+  }
+}
 
 function focusCommentById(id: string): void {
   activeCommentId.value = id;
@@ -467,28 +674,230 @@ function createDecorations(params: {
   return DecorationSet.create(state.doc, decorations);
 }
 
+function handleSelectionUpdate(params: { editor: TiptapEditor }): void {
+  const ed = params.editor;
+  const { from, to, empty } = ed.state.selection;
+
+  if (empty) {
+    hideSelectionPopup();
+    return;
+  }
+
+  const wrapper = editorContentWrapper.value;
+  if (!wrapper) {
+    hideSelectionPopup();
+    return;
+  }
+
+  try {
+    const startCoords = ed.view.coordsAtPos(from);
+    const endCoords = ed.view.coordsAtPos(to);
+
+    const middleLeft = (startCoords.left + endCoords.left) / 2;
+    const topBase = Math.min(startCoords.top, endCoords.top);
+
+    const wrapperRect = wrapper.getBoundingClientRect();
+
+    selectionPopup.value = {
+      visible: true,
+      top: topBase - wrapperRect.top,
+      left: middleLeft - wrapperRect.left,
+    };
+  } catch {
+    hideSelectionPopup();
+  }
+}
+
+function handleEditorUpdate(params: {
+  editor: TiptapEditor;
+  transaction: Transaction;
+}): void {
+  if (editorMode.value !== 'propose') {
+    return;
+  }
+
+  const tr = params.transaction;
+
+  if (!tr.docChanged) {
+    return;
+  }
+
+  const yState = getYSyncStateFromEditor();
+  if (!yState) {
+    return;
+  }
+
+  // Находим диапазон вставленного текста по шагам транзакции
+  let insertionFrom: number | null = null;
+  let insertionTo: number | null = null;
+
+  tr.steps.forEach((step) => {
+    const s = step as unknown as {
+      from?: number;
+      to?: number;
+      slice?: { size: number };
+    };
+
+    if (!s.slice || typeof s.slice.size !== 'number' || s.slice.size === 0) {
+      return;
+    }
+
+    if (typeof s.from !== 'number' || typeof s.to !== 'number') {
+      return;
+    }
+
+    // Интересует только «чистая» вставка (from === to), без замены выделенного текста
+    if (s.from !== s.to) {
+      return;
+    }
+
+    // ВАЖНО: assoc = -1, чтобы взять позицию СЛЕВА от вставки, а не справа
+    const mappedFrom = tr.mapping.map(s.from, -1);
+    const start = mappedFrom;
+    const end = mappedFrom + s.slice.size;
+
+    if (insertionFrom === null || start < insertionFrom) {
+      insertionFrom = start;
+    }
+    if (insertionTo === null || end > insertionTo) {
+      insertionTo = end;
+    }
+  });
+
+  if (
+    insertionFrom === null ||
+    insertionTo === null ||
+    insertionFrom === insertionTo
+  ) {
+    return;
+  }
+
+  const startNew = insertionFrom;
+  const endNew = insertionTo;
+
+  // Привязка к Yjs через RelativePosition
+  const startRelNew = absolutePositionToRelativePosition(
+    startNew,
+    yState.type,
+    yState.binding.mapping
+  );
+  const endRelNew = absolutePositionToRelativePosition(
+    endNew,
+    yState.type,
+    yState.binding.mapping
+  );
+
+  if (!startRelNew || !endRelNew) {
+    // eslint-disable-next-line no-console
+    console.warn('[proposed] failed to create relative positions for insert');
+    return;
+  }
+
+  ydoc.transact(() => {
+    let reusedExisting = false;
+    const currentId = activeProposalId.value;
+
+    // Попытка расширить текущий активный proposal, если вставка попадает внутрь него
+    if (currentId) {
+      const existing = proposedChangesMap.get(currentId);
+      if (existing && existing.status === 'pending') {
+        try {
+          const existingStartRel = base64ToRelativePosition(
+            existing.anchor.start
+          );
+          const existingEndRel = base64ToRelativePosition(existing.anchor.end);
+
+          const existingStartAbs = relativePositionToAbsolutePosition(
+            yState.doc,
+            yState.type,
+            existingStartRel,
+            yState.binding.mapping
+          );
+          const existingEndAbs = relativePositionToAbsolutePosition(
+            yState.doc,
+            yState.type,
+            existingEndRel,
+            yState.binding.mapping
+          );
+
+          if (
+            existingStartAbs !== null &&
+            existingEndAbs !== null &&
+            startNew >= existingStartAbs &&
+            startNew <= existingEndAbs
+          ) {
+            const newAnchor: commentAnchor = {
+              start: relativePositionToBase64(
+                absolutePositionToRelativePosition(
+                  existingStartAbs,
+                  yState.type,
+                  yState.binding.mapping
+                ) as Y.RelativePosition
+              ),
+              end: relativePositionToBase64(
+                absolutePositionToRelativePosition(
+                  endNew,
+                  yState.type,
+                  yState.binding.mapping
+                ) as Y.RelativePosition
+              ),
+            };
+
+            const updated: proposedChangeData = {
+              ...existing,
+              anchor: newAnchor,
+            };
+
+            proposedChangesMap.set(currentId, updated);
+            reusedExisting = true;
+          }
+        } catch (error) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            '[proposed] failed to extend proposal',
+            currentId,
+            error
+          );
+        }
+      }
+    }
+
+    // Если не получилось расширить существующее предложение — создаётся новое
+    if (!reusedExisting) {
+      const id =
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID()
+          : String(Date.now());
+
+      const anchor: commentAnchor = {
+        start: relativePositionToBase64(startRelNew),
+        end: relativePositionToBase64(endRelNew),
+      };
+
+      const change: proposedChangeData = {
+        id,
+        authorName: currentUser.name,
+        status: 'pending',
+        anchor,
+      };
+
+      proposedChangesMap.set(id, change);
+      activeProposalId.value = id;
+    }
+  });
+
+  const ed = editor.value;
+  if (ed) {
+    const metaTr = ed.state.tr.setMeta(proposedPluginKey, {
+      type: 'proposals-updated',
+    });
+    ed.view.dispatch(metaTr);
+  }
+}
+
 function createCommentsPlugin(
   options: CommentsPluginOptions
 ): Plugin<DecorationSet> {
-  function recreateWithFallback(
-    tr: Transaction,
-    oldDecorationSet: DecorationSet,
-    newState: EditorState
-  ): DecorationSet {
-    const currentComments = options.getComments();
-    const fresh = createDecorations({
-      state: newState,
-      comments: currentComments,
-      activeCommentId: options.getActiveCommentId(),
-    });
-
-    if (fresh === DecorationSet.empty && currentComments.length > 0) {
-      return oldDecorationSet.map(tr.mapping, newState.doc);
-    }
-
-    return fresh;
-  }
-
   return new Plugin<DecorationSet>({
     key: commentsPluginKey,
     state: {
@@ -507,11 +916,18 @@ function createCommentsPlugin(
       ) {
         const meta = tr.getMeta(commentsPluginKey);
 
+        // Если ничего не поменялось ни в документе, ни в метаданных — оставляем старый набор
         if (!tr.docChanged && !meta) {
           return oldDecorationSet;
         }
 
-        return recreateWithFallback(tr, oldDecorationSet, newState);
+        // Всегда пересоздаём декорации из актуального списка comments
+        // без fallback-а, чтобы после resolve подсветка гарантированно исчезала.
+        return createDecorations({
+          state: newState,
+          comments: options.getComments(),
+          activeCommentId: options.getActiveCommentId(),
+        });
       },
     },
     props: {
@@ -537,6 +953,14 @@ function createCommentsPlugin(
 
         if (options.onCommentClick) {
           options.onCommentClick(commentId);
+        }
+
+        // Скролл к карточке комментария
+        const card = document.querySelector<HTMLElement>(
+          `[data-comment-card-id="${commentId}"]`
+        );
+        if (card) {
+          card.scrollIntoView({ block: 'nearest' });
         }
 
         // Триггер пересчёта подсветки для активного комментария
@@ -569,6 +993,174 @@ const commentsHighlightExtension = Extension.create({
   },
 });
 
+const proposedPluginKey = new PluginKey<DecorationSet>('proposed-plugin');
+
+function createProposedDecorations(params: {
+  state: EditorState;
+  changes: proposedChangeData[];
+  activeProposalId: string | null;
+}) {
+  const { state, changes, activeProposalId } = params;
+
+  const raw = ySyncPluginKey.getState(state) as
+    | (YSyncState & { binding: YSyncBinding | null })
+    | null
+    | undefined;
+
+  if (!raw || !raw.doc || !raw.type || !raw.binding || !raw.binding.mapping) {
+    return DecorationSet.empty;
+  }
+
+  const yState = raw as YSyncState;
+  const decorations: Decoration[] = [];
+
+  for (const change of changes) {
+    if (change.status !== 'pending') continue;
+
+    try {
+      const startRel = base64ToRelativePosition(change.anchor.start);
+      const endRel = base64ToRelativePosition(change.anchor.end);
+
+      const startAbs = relativePositionToAbsolutePosition(
+        yState.doc,
+        yState.type,
+        startRel,
+        yState.binding.mapping
+      );
+      const endAbs = relativePositionToAbsolutePosition(
+        yState.doc,
+        yState.type,
+        endRel,
+        yState.binding.mapping
+      );
+
+      if (startAbs === null || endAbs === null) {
+        continue;
+      }
+
+      const from = Math.min(startAbs, endAbs);
+      const to = Math.max(startAbs, endAbs);
+
+      if (from === to) {
+        continue;
+      }
+
+      const classNames = ['tiptap-proposed-mark'];
+      const isActive = change.id === activeProposalId;
+
+      if (isActive) {
+        classNames.push('tiptap-proposed-mark-selected');
+      }
+
+      decorations.push(
+        Decoration.inline(
+          from,
+          to,
+          {
+            class: classNames.join(' '),
+            'data-proposed-id': change.id,
+          },
+          { proposalId: change.id }
+        )
+      );
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[proposed-plugin] failed to decode anchor',
+        change.id,
+        error
+      );
+    }
+  }
+
+  if (decorations.length === 0) {
+    return DecorationSet.empty;
+  }
+
+  return DecorationSet.create(state.doc, decorations);
+}
+
+function createProposedPlugin(): Plugin<DecorationSet> {
+  return new Plugin<DecorationSet>({
+    key: proposedPluginKey,
+    state: {
+      init(_, state) {
+        return createProposedDecorations({
+          state,
+          changes: proposedChanges.value,
+          activeProposalId: activeProposalId.value,
+        });
+      },
+      apply(
+        tr: Transaction,
+        oldDecorationSet: DecorationSet,
+        _oldState: EditorState,
+        newState: EditorState
+      ) {
+        const meta = tr.getMeta(proposedPluginKey);
+
+        if (!tr.docChanged && !meta) {
+          return oldDecorationSet;
+        }
+
+        return createProposedDecorations({
+          state: newState,
+          changes: proposedChanges.value,
+          activeProposalId: activeProposalId.value,
+        });
+      },
+    },
+    props: {
+      decorations(state) {
+        return proposedPluginKey.getState(state) ?? null;
+      },
+      handleClick(view: EditorView, pos: number, event: MouseEvent): boolean {
+        const decoSet = proposedPluginKey.getState(view.state);
+        if (!decoSet) return false;
+
+        const found = decoSet.find(pos, pos);
+        if (found.length === 0) return false;
+
+        const deco = found[0];
+        if (!deco) return false;
+
+        const spec = deco.spec as { proposalId?: string } | undefined;
+        const proposalId =
+          spec?.proposalId ??
+          (deco.spec as { 'data-proposed-id'?: string })['data-proposed-id'];
+
+        if (!proposalId || typeof proposalId !== 'string') {
+          return false;
+        }
+
+        activeProposalId.value = proposalId;
+
+        const card = document.querySelector<HTMLElement>(
+          `[data-proposal-card-id="${proposalId}"]`
+        );
+        if (card) {
+          card.scrollIntoView({ block: 'nearest' });
+        }
+
+        const tr = view.state.tr.setMeta(proposedPluginKey, {
+          type: 'active-proposal-changed',
+          id: proposalId,
+        });
+        view.dispatch(tr);
+
+        return true;
+      },
+    },
+  });
+}
+
+const proposedHighlightExtension = Extension.create({
+  name: 'proposedHighlight',
+  addProseMirrorPlugins() {
+    return [createProposedPlugin()];
+  },
+});
+
 // --------------------
 // Tiptap Editor + Collaboration + CollaborationCaret
 // --------------------
@@ -590,12 +1182,15 @@ const editor = useEditor({
       },
     }),
     commentsHighlightExtension,
+    proposedHighlightExtension,
   ],
   editable: true,
   onCreate: ({ editor: ed }) => {
     // eslint-disable-next-line no-console
     console.log('[tiptap] editor created', ed.state.doc.toJSON());
   },
+  onUpdate: handleEditorUpdate,
+  onSelectionUpdate: handleSelectionUpdate,
 });
 
 const addText = ref<string>('');
@@ -613,6 +1208,9 @@ let awarenessChangeHandler:
   | null = null;
 
 let commentsObserver: ((event: unknown, transaction: unknown) => void) | null =
+  null;
+
+let proposedObserver: ((event: unknown, transaction: unknown) => void) | null =
   null;
 
 // --------------------
@@ -642,7 +1240,6 @@ onMounted(() => {
   commentsObserver = (): void => {
     updateCommentsFromYjs();
 
-    // Дополнительно — сигнал плагину, что комментарии поменялись
     const ed = editor.value;
     if (ed) {
       const tr = ed.state.tr.setMeta(commentsPluginKey, {
@@ -653,8 +1250,23 @@ onMounted(() => {
   };
   commentsMap.observe(commentsObserver);
 
-  // Инициализировать комментарии из уже существующего состояния Y.Doc (если есть)
+  // Подписка на изменения Y.Map с предложенными изменениями
+  proposedObserver = (): void => {
+    updateProposedChangesFromYjs();
+
+    const ed = editor.value;
+    if (ed) {
+      const tr = ed.state.tr.setMeta(proposedPluginKey, {
+        type: 'proposals-updated',
+      });
+      ed.view.dispatch(tr);
+    }
+  };
+  proposedChangesMap.observe(proposedObserver);
+
+  // Инициализация из текущего состояния Y.Doc
   updateCommentsFromYjs();
+  updateProposedChangesFromYjs();
 
   // eslint-disable-next-line no-console
   console.log('[editor] instance', editor.value);
@@ -669,10 +1281,13 @@ onBeforeUnmount(() => {
     commentsMap.unobserve(commentsObserver);
   }
 
+  if (proposedObserver) {
+    proposedChangesMap.unobserve(proposedObserver);
+  }
+
   editor.value?.destroy();
   provider.destroy();
 });
-
 // --------------------
 // Вспомогательная функция для доступа к YSyncState из редактора
 // --------------------
@@ -767,6 +1382,82 @@ const addCommentFromSelection = (): void => {
   addText.value = '';
 };
 
+function handleAddCommentFromPopup(): void {
+  const text = selectionCommentText.value.trim();
+  if (!text) return;
+
+  // прокидываем текст в существующий поток создания комментария
+  addText.value = text;
+  addCommentFromSelection();
+  hideSelectionPopup();
+}
+
+const approveProposedChange = (id: string): void => {
+  const existing = proposedChangesMap.get(id);
+  if (!existing) return;
+
+  const updated: proposedChangeData = {
+    ...existing,
+    status: 'approved',
+  };
+
+  ydoc.transact(() => {
+    proposedChangesMap.set(id, updated);
+  });
+
+  if (activeProposalId.value === id) {
+    activeProposalId.value = null;
+  }
+};
+
+const deleteProposedChange = (id: string): void => {
+  const ed = editor.value;
+  if (!ed) return;
+
+  const change = proposedChangesMap.get(id);
+  if (!change) return;
+
+  const yState = getYSyncStateFromEditor();
+  if (!yState) return;
+
+  try {
+    const startRel = base64ToRelativePosition(change.anchor.start);
+    const endRel = base64ToRelativePosition(change.anchor.end);
+
+    const startAbs = relativePositionToAbsolutePosition(
+      yState.doc,
+      yState.type,
+      startRel,
+      yState.binding.mapping
+    );
+    const endAbs = relativePositionToAbsolutePosition(
+      yState.doc,
+      yState.type,
+      endRel,
+      yState.binding.mapping
+    );
+
+    if (startAbs !== null && endAbs !== null && startAbs !== endAbs) {
+      const from = Math.min(startAbs, endAbs);
+      const to = Math.max(startAbs, endAbs);
+
+      // Удаление текста из документа через Tiptap → синхронизация через y-sync
+      ed.chain().focus().deleteRange({ from, to }).run();
+    }
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn('[proposed] failed to delete range for proposal', id, error);
+  }
+
+  ydoc.transact(() => {
+    proposedChangesMap.delete(id);
+  });
+
+  if (activeProposalId.value === id) {
+    activeProposalId.value = null;
+  }
+};
+
 const resolveComment = (id: string, resolved: boolean): void => {
   const existing = commentsMap.get(id);
   if (!existing) return;
@@ -789,10 +1480,6 @@ const removeComment = (id: string): void => {
 </script>
 
 <style scoped>
-.prose :global(span[data-comment-id]) {
-  cursor: pointer;
-}
-
 /* Кастомный курсор других пользователей */
 :global(.tiptap .collaboration-carets__caret) {
   position: relative;
@@ -826,6 +1513,7 @@ const removeComment = (id: string): void => {
   pointer-events: none;
 }
 :global(.tiptap-comment-mark) {
+  cursor: pointer;
   background-color: rgba(250, 204, 21, 0.25); /* мягкий жёлтый */
   border-bottom: 1px dotted rgba(234, 179, 8, 0.9);
   border-radius: 2px;
@@ -833,5 +1521,19 @@ const removeComment = (id: string): void => {
 }
 :global(.tiptap-comment-mark-selected) {
   background-color: rgba(250, 204, 21, 0.85);
+}
+
+:global(.tiptap-proposed-mark) {
+  cursor: pointer;
+  background-color: rgba(37, 99, 235, 0.18);
+  border-bottom: 1px solid rgba(37, 99, 235, 0.85);
+  border-radius: 2px;
+}
+:global(.tiptap-proposed-mark-selected) {
+  background-color: rgba(37, 99, 235, 0.48);
+}
+
+.selection-popup {
+  transform: translate(-50%, -100%);
 }
 </style>
