@@ -112,6 +112,45 @@
           <span>Текущий пользователь: {{ currentUser.name }}</span>
         </div>
       </div>
+      <div class="mt-6 border rounded-lg bg-white">
+        <div class="px-4 py-2 border-b flex items-center justify-between">
+          <div class="text-sm font-medium">История изменений</div>
+          <button
+            type="button"
+            class="text-xs px-2 py-1 border rounded hover:bg-gray-50"
+            @click="clearHistory"
+          >
+            Очистить историю
+          </button>
+        </div>
+
+        <div class="p-4 max-h-64 overflow-y-auto text-xs">
+          <div v-if="historyView.length === 0" class="text-gray-500">
+            Пока нет записей истории.
+          </div>
+
+          <ul v-else class="space-y-2">
+            <li
+              v-for="entry in historyView"
+              :key="entry.id"
+              class="border rounded px-2 py-1 bg-gray-50"
+            >
+              <div class="flex items-center justify-between mb-1">
+                <span class="font-semibold">
+                  {{ entry.kind }}
+                </span>
+                <span class="text-[10px] text-gray-500">
+                  {{ new Date(entry.createdAt).toLocaleTimeString() }}
+                </span>
+              </div>
+              <div class="text-gray-700">
+                <span class="font-medium">{{ entry.userName }}</span>
+                <span v-if="entry.text"> : {{ entry.text }} </span>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </div>
     </div>
 
     <aside class="w-[340px] shrink-0">
@@ -262,7 +301,8 @@ import { Decoration, DecorationSet } from '@tiptap/pm/view';
 import type { EditorView } from '@tiptap/pm/view';
 import { Extension } from '@tiptap/core';
 import type { Editor as TiptapEditor } from '@tiptap/core';
-
+import { useHistory } from '../composables/useHistory';
+import type { historyEntry } from '../historyTypes';
 // --------------------
 // Типы
 // --------------------
@@ -359,11 +399,44 @@ const provider = new HocuspocusProvider({
 
 const ydoc = provider.document as Y.Doc;
 
+const history = useHistory({
+  ydoc,
+  currentUser,
+});
+
 // Y.Map для комментариев — единый источник правды
 const commentsMap: Y.Map<commentData> = ydoc.getMap<commentData>('comments');
 
 const proposedChangesMap: Y.Map<proposedChangeData> =
   ydoc.getMap<proposedChangeData>('proposedChanges');
+
+// История изменений
+const historyMap: Y.Map<historyEntry> = ydoc.getMap<historyEntry>('history');
+
+const historyEntries = ref<historyEntry[]>([]);
+
+function updateHistoryFromYjs(): void {
+  const next: historyEntry[] = [];
+  historyMap.forEach((value) => {
+    next.push(value);
+  });
+
+  // сортируем по времени (от старых к новым)
+  next.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+  historyEntries.value = next;
+}
+
+// Упрощённая проекция для шаблона
+const historyView = computed(() =>
+  historyEntries.value.map((entry) => ({
+    id: entry.id,
+    kind: entry.kind,
+    userName: entry.userName,
+    createdAt: entry.createdAt,
+    text: entry.payload.text,
+  }))
+);
 
 // --------------------
 // Vue-реактивный список предложенных изменений + режим редактора
@@ -722,6 +795,7 @@ function handleSelectionUpdate(params: { editor: TiptapEditor }): void {
   } catch {
     hideSelectionPopup();
   }
+  history.resetTextHistoryGrouping();
 }
 
 function handleEditorUpdate(params: {
@@ -842,13 +916,8 @@ function handleEditorUpdate(params: {
             startNew <= existingRange.to
           ) {
             const newAnchor: commentAnchor = {
-              start: relativePositionToBase64(
-                absolutePositionToRelativePosition(
-                  existingRange.from,
-                  yState.type,
-                  yState.binding.mapping
-                ) as Y.RelativePosition
-              ),
+              // старт оставляем как есть, чтобы не дёргать якорь:
+              start: existing.anchor.start,
               end: relativePositionToBase64(
                 absolutePositionToRelativePosition(
                   endNew,
@@ -867,6 +936,8 @@ function handleEditorUpdate(params: {
             };
 
             proposedChangesMap.set(currentId, updated);
+            history.updateProposalInsertText(currentId, mergedText);
+
             reusedExisting = true;
           }
         } catch (error) {
@@ -903,6 +974,7 @@ function handleEditorUpdate(params: {
 
       proposedChangesMap.set(id, change);
       activeProposalId.value = id;
+      history.logProposalInsertCreated(id, newTextFull);
     }
   });
 
@@ -1118,6 +1190,7 @@ function createDeletionProposal(
 
       proposedChangesMap.set(id, change);
       activeProposalId.value = id;
+      history.logProposalDeleteCreated(id, text);
     }
   });
 
@@ -1150,13 +1223,19 @@ function createCommentsPlugin(
       ) {
         const meta = tr.getMeta(commentsPluginKey);
 
-        // Если ничего не поменялось ни в документе, ни в метаданных — оставляем старый набор
+        // ничего не поменялось — возвращаем старое
         if (!tr.docChanged && !meta) {
           return oldDecorationSet;
         }
 
-        // Всегда пересоздаём декорации из актуального списка comments
-        // без fallback-а, чтобы после resolve подсветка гарантированно исчезала.
+        // если документ изменился, но МЕТА нет — это обычный набор текста/удаление
+        // даём ProseMirror сам смэпить декорации
+        if (tr.docChanged && !meta) {
+          return oldDecorationSet.map(tr.mapping, newState.doc);
+        }
+
+        // во всех случаях, когда есть meta (обновление списка/активация и т.п.),
+        // пересоздаём декорации из актуального списка comments + Y-анкеров
         return createDecorations({
           state: newState,
           comments: options.getComments(),
@@ -1189,7 +1268,6 @@ function createCommentsPlugin(
           options.onCommentClick(commentId);
         }
 
-        // Скролл к карточке комментария
         const card = document.querySelector<HTMLElement>(
           `[data-comment-card-id="${commentId}"]`
         );
@@ -1197,7 +1275,6 @@ function createCommentsPlugin(
           card.scrollIntoView({ block: 'nearest' });
         }
 
-        // Триггер пересчёта подсветки для активного комментария
         const tr = view.state.tr.setMeta(commentsPluginKey, {
           type: 'active-comment-changed',
           id: commentId,
@@ -1257,30 +1334,30 @@ function createProposedDecorations(params: {
     }
 
     const { from, to } = range;
-      const classNames = ['tiptap-proposed-mark'];
+    const classNames = ['tiptap-proposed-mark'];
 
-      if (change.kind === 'delete') {
-        classNames.push('tiptap-proposed-mark-delete');
-      } else {
-        classNames.push('tiptap-proposed-mark-insert');
-      }
+    if (change.kind === 'delete') {
+      classNames.push('tiptap-proposed-mark-delete');
+    } else {
+      classNames.push('tiptap-proposed-mark-insert');
+    }
 
-      const isActive = change.id === activeProposalId;
-      if (isActive) {
-        classNames.push('tiptap-proposed-mark-selected');
-      }
+    const isActive = change.id === activeProposalId;
+    if (isActive) {
+      classNames.push('tiptap-proposed-mark-selected');
+    }
 
-      decorations.push(
-        Decoration.inline(
-          from,
-          to,
-          {
-            class: classNames.join(' '),
-            'data-proposed-id': change.id,
-          },
-          { proposalId: change.id }
-        )
-      );
+    decorations.push(
+      Decoration.inline(
+        from,
+        to,
+        {
+          class: classNames.join(' '),
+          'data-proposed-id': change.id,
+        },
+        { proposalId: change.id }
+      )
+    );
   }
 
   if (decorations.length === 0) {
@@ -1313,6 +1390,13 @@ function createProposedPlugin(): Plugin<DecorationSet> {
           return oldDecorationSet;
         }
 
+        // Обычный ввод/удаление текста — просто мапим существующие декорации
+        if (tr.docChanged && !meta) {
+          return oldDecorationSet.map(tr.mapping, newState.doc);
+        }
+
+        // Есть meta (обновлены proposals / сменился активный) —
+        // пересоздаём декорации через Y-анкеры
         return createProposedDecorations({
           state: newState,
           changes: proposedChanges.value,
@@ -1368,6 +1452,97 @@ const proposedHighlightExtension = Extension.create({
   name: 'proposedHighlight',
   addProseMirrorPlugins() {
     return [createProposedPlugin()];
+  },
+});
+
+const textHistoryPluginKey = new PluginKey('text-history-plugin');
+
+const textHistoryExtension = Extension.create({
+  name: 'textHistory',
+  addProseMirrorPlugins() {
+    return [
+      new Plugin({
+        key: textHistoryPluginKey,
+        apply(
+          tr: Transaction,
+          value: unknown,
+          oldState: EditorState,
+          newState: EditorState
+        ) {
+          if (!tr.docChanged) {
+            return value;
+          }
+
+          const addToHistoryMeta = tr.getMeta('addToHistory');
+          if (addToHistoryMeta === false) {
+            return value;
+          }
+
+          // режим propose обрабатывается через proposals, а не через TextInserted/TextDeleted
+          if (editorMode.value === 'propose') {
+            return value;
+          }
+
+          const oldDoc = oldState.doc as ProsemirrorNode;
+          const newDoc = newState.doc as ProsemirrorNode;
+
+          tr.steps.forEach((step) => {
+            const s = step as unknown as {
+              from?: number;
+              to?: number;
+              slice?: { size: number };
+            };
+
+            if (typeof s.from !== 'number' || typeof s.to !== 'number') {
+              return;
+            }
+
+            const sliceSize = s.slice?.size ?? 0;
+
+            const isDelete = s.to > s.from && sliceSize === 0;
+            const isInsert = sliceSize > 0 && s.from === s.to;
+            const isReplace = s.to > s.from && sliceSize > 0;
+
+            // --- УДАЛЕНИЕ и delete-часть replace ---
+            if (isDelete || isReplace) {
+              const delFrom = s.from;
+              const delTo = s.to;
+
+              const deletedText = oldDoc.textBetween(delFrom, delTo, '\n');
+              if (deletedText) {
+                // можно логировать диапазон, если это нужно
+                history.logTextDeleted(
+                  { from: delFrom, to: delTo },
+                  deletedText
+                );
+              }
+            }
+
+            // --- ВСТАВКА и insert-часть replace ---
+            if (isInsert || isReplace) {
+              // позиция вставки в НОВОМ документе
+              const insertFromNew = tr.mapping.map(s.from, 1);
+              const insertToNew = insertFromNew + sliceSize;
+
+              const insertedText = newDoc.textBetween(
+                insertFromNew,
+                insertToNew,
+                '\n'
+              );
+
+              if (insertedText) {
+                history.logTextInserted(
+                  { from: insertFromNew, to: insertToNew },
+                  insertedText
+                );
+              }
+            }
+          });
+
+          return value;
+        },
+      }),
+    ];
   },
 });
 
@@ -1559,6 +1734,7 @@ const editor = useEditor({
     proposedHighlightExtension,
     proposedDeletionExtension,
     blockInsertInDeleteExtension,
+    textHistoryExtension,
   ],
   editable: !isCommentOnly.value,
   onCreate: ({ editor: ed }) => {
@@ -1586,6 +1762,9 @@ let commentsObserver: ((event: unknown, transaction: unknown) => void) | null =
   null;
 
 let proposedObserver: ((event: unknown, transaction: unknown) => void) | null =
+  null;
+
+let historyObserver: ((event: unknown, transaction: unknown) => void) | null =
   null;
 
 // --------------------
@@ -1638,7 +1817,14 @@ onMounted(() => {
     }
   };
   proposedChangesMap.observe(proposedObserver);
+  // Подписка на изменения истории
+  historyObserver = (): void => {
+    updateHistoryFromYjs();
+  };
+  historyMap.observe(historyObserver);
 
+  // Инициализация истории из текущего состояния
+  updateHistoryFromYjs();
   // Инициализация из текущего состояния Y.Doc
   updateCommentsFromYjs();
   updateProposedChangesFromYjs();
@@ -1658,6 +1844,9 @@ onBeforeUnmount(() => {
 
   if (proposedObserver) {
     proposedChangesMap.unobserve(proposedObserver);
+  }
+  if (historyObserver) {
+    historyMap.unobserve(historyObserver);
   }
 
   editor.value?.destroy();
@@ -1753,7 +1942,7 @@ const addCommentFromSelection = (): void => {
   ydoc.transact(() => {
     commentsMap.set(id, newComment);
   });
-
+  history.logCommentCreated(id, text);
   addText.value = '';
 };
 
@@ -1806,6 +1995,12 @@ const approveProposedChange = (id: string): void => {
   if (activeProposalId.value === id) {
     activeProposalId.value = null;
   }
+
+  if (change.kind === 'insert') {
+    history.logProposalInsertApproved(id, change.text);
+  } else {
+    history.logProposalDeleteApproved(id, change.text);
+  }
 };
 
 const deleteProposedChange = (id: string): void => {
@@ -1843,6 +2038,12 @@ const deleteProposedChange = (id: string): void => {
   if (activeProposalId.value === id) {
     activeProposalId.value = null;
   }
+
+  if (change.kind === 'insert') {
+    history.logProposalInsertDeleted(id, change.text);
+  } else {
+    history.logProposalDeleteDeleted(id, change.text);
+  }
 };
 
 const resolveComment = (id: string, resolved: boolean): void => {
@@ -1857,12 +2058,28 @@ const resolveComment = (id: string, resolved: boolean): void => {
   ydoc.transact(() => {
     commentsMap.set(id, updated);
   });
+
+  history.logCommentResolved(id, updated.text);
+};
+
+const clearHistory = (): void => {
+  ydoc.transact(() => {
+    historyMap.clear();
+  });
+
+  // сбросить группировку по тексту, чтобы новые вставки/удаления шли как новые записи
+  history.resetTextHistoryGrouping();
+  historyEntries.value = [];
 };
 
 const removeComment = (id: string): void => {
+  const existing = commentsMap.get(id);
   ydoc.transact(() => {
     commentsMap.delete(id);
   });
+  if (existing) {
+    history.logCommentDeleted(id, existing.text);
+  }
 };
 </script>
 
