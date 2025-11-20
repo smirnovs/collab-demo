@@ -45,13 +45,6 @@ export interface CollabUser {
   color: string;
 }
 
-export interface AwarenessUser {
-  clientId: number;
-  name: string;
-  color: string;
-  isLocal: boolean;
-}
-
 export interface YSyncBinding {
   mapping: ProsemirrorMapping;
 }
@@ -63,8 +56,8 @@ export interface YSyncState {
 }
 
 export function createRandomColor(): string {
-  const hue = Math.floor(Math.random() * 360);
-  return `hsl(${hue} 80% 60%)`;
+  const value = Math.floor(Math.random() * 0xffffff);
+  return `#${value.toString(16).padStart(6, '0')}`;
 }
 
 export function createRandomUser(): CollabUser {

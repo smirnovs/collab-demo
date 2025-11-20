@@ -26,18 +26,28 @@
         >
           Предложения добавить текст или удалить текст
         </button>
-        <button
-          type="button"
-          class="px-3 py-1 rounded border text-xs font-medium transition-colors"
-          :class="
-            isCommentOnly
-              ? 'bg-yellow-600 text-white border-blue-600'
-              : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'
-          "
-          @click="toggleOnlyComments"
-        >
-          Только комментирование
-        </button>
+        <label class="flex items-center gap-2 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            class="peer sr-only"
+            :checked="isCommentOnly"
+            @change="toggleOnlyComments"
+          />
+
+          <svg
+            viewBox="0 0 20 20"
+            fill="currentColor"
+            class="w-4 h-4 rounded border shrink-0 border-gray-400 text-transparent transition-colors peer-checked:bg-yellow-600 peer-checked:border-yellow-600 peer-checked:text-white"
+          >
+            <path
+              fill-rule="evenodd"
+              d="M16.707 5.293a1 1 0 010 1.414l-7.25 7.25a1 1 0 01-1.414 0l-3.25-3.25a1 1 0 111.414-1.414l2.543 2.543 6.543-6.543a1 1 0 011.414 0z"
+              clip-rule="evenodd"
+            />
+          </svg>
+
+          <span class="text-sm text-gray-800"> Только комментирование </span>
+        </label>
       </div>
       <div class="flex gap-3 mb-3">
         <RouterLink
@@ -287,7 +297,7 @@
 
 <script setup lang="ts">
 import * as Y from 'yjs';
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { onBeforeUnmount, onMounted, ref } from 'vue';
 import { useEditor, EditorContent } from '@tiptap/vue-3';
 import StarterKit from '@tiptap/starter-kit';
 import Collaboration from '@tiptap/extension-collaboration';
@@ -299,13 +309,13 @@ import {
   createRandomUser,
   refreshHighlights,
 } from '../composables/useCollabHelpers';
-
 import { useComments, commentsPluginKey } from '../composables/useComments';
 import { useProposals, proposedPluginKey } from '../composables/useProposals';
 import { useEditorUpdate } from '../composables/useEditorUpdate';
 import { useDeletionProposal } from '../composables/useDeletionProposal';
-import type { historyEntry } from '../types/historyTypes';
+import { useProposalActionsHistory } from '../composables/useProposalActionsHistory';
 import type { snapshotEntry } from '../types/snapshotTypes';
+
 // --------------------
 // Типы
 // --------------------
@@ -342,6 +352,9 @@ const history = useHistory({
   ydoc,
   currentUser,
 });
+
+const { historyMap, historyView, updateHistoryFromYjs, clearHistory } =
+  useProposalActionsHistory({ ydoc });
 
 const {
   comments,
@@ -409,33 +422,6 @@ const { proposedDeletionExtension } = useDeletionProposal({
   proposedPluginKey,
   getEditor: () => editor.value,
 });
-
-// История изменений
-const historyMap: Y.Map<historyEntry> = ydoc.getMap<historyEntry>('history');
-
-const historyEntries = ref<historyEntry[]>([]);
-
-function updateHistoryFromYjs(): void {
-  const next: historyEntry[] = [];
-  historyMap.forEach((value) => {
-    next.push(value);
-  });
-
-  // сортируем по времени (от старых к новым)
-  next.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-
-  historyEntries.value = next;
-}
-
-const historyView = computed(() =>
-  historyEntries.value.map((entry) => ({
-    id: entry.id,
-    kind: entry.kind,
-    userName: entry.userName,
-    createdAt: entry.createdAt,
-    text: entry.payload.text,
-  }))
-);
 
 // --------------------
 // реактивный список онлайн-пользователей (awareness)
@@ -685,13 +671,6 @@ onBeforeUnmount(() => {
 
   editor.value?.destroy();
 });
-
-const clearHistory = (): void => {
-  ydoc.transact(() => {
-    historyMap.clear();
-  });
-  historyEntries.value = [];
-};
 </script>
 
 <style scoped>
@@ -751,7 +730,7 @@ const clearHistory = (): void => {
 }
 
 .selection-popup {
-  transform: translate(-50%, -100%);
+  transform: translate(-50%, -110%);
 }
 
 :global(.tiptap-proposed-mark-delete) {

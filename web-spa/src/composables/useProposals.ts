@@ -245,16 +245,33 @@ export function useProposals(options: UseProposalsOptions) {
           _oldState: EditorState,
           newState: EditorState
         ) {
-          const meta = tr.getMeta(proposedPluginKey);
+          const meta = tr.getMeta(proposedPluginKey) as
+            | { type: string; id?: string }
+            | undefined;
 
+          // снова проверяем y-sync$
+          const ySyncMeta = tr.getMeta('y-sync$');
+
+          // 1) Remote-update от Yjs → полный пересчёт подсветки предложений
+          if (ySyncMeta) {
+            return createProposedDecorations({
+              state: newState,
+              changes: proposedChanges.value,
+              activeProposalId: activeProposalId.value,
+            });
+          }
+
+          // 2) Нет изменений и нет нашего meta → оставляем как есть
           if (!tr.docChanged && !meta) {
             return oldDecorationSet;
           }
 
+          // 3) Локальные изменения документа → нормальный map
           if (tr.docChanged && !meta) {
             return oldDecorationSet.map(tr.mapping, newState.doc);
           }
 
+          // 4) Наше meta (proposals-updated / active-proposal-changed и т.п.)
           return createProposedDecorations({
             state: newState,
             changes: proposedChanges.value,

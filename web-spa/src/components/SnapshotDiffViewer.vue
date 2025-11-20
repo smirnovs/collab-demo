@@ -25,7 +25,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, watch } from 'vue';
+import { computed, onBeforeUnmount, watchEffect } from 'vue';
 import { useEditor, EditorContent } from '@tiptap/vue-3';
 import StarterKit from '@tiptap/starter-kit';
 import { Mark, type JSONContent } from '@tiptap/core';
@@ -97,7 +97,6 @@ function lcs(a: string[], b: string[]): { aIdx: number[]; bIdx: number[] } {
     Array<number>(m + 1).fill(0)
   );
 
-  // заполняем DP-сетку снизу вверх
   for (let i = n - 1; i >= 0; i -= 1) {
     const dpRow = dp[i]!;
     const dpRowNext = dp[i + 1]!;
@@ -174,7 +173,6 @@ function diffTokens(aText: string, bText: string): diffChunk[] {
     const aToken = ai < aTokens.length ? aTokens[ai] : undefined;
     const bToken = bi < bTokens.length ? bTokens[bi] : undefined;
 
-    // совпадающие токены (часть LCS)
     if (
       currentAIdx !== undefined &&
       currentBIdx !== undefined &&
@@ -190,7 +188,6 @@ function diffTokens(aText: string, bText: string): diffChunk[] {
       continue;
     }
 
-    // удалённые токены из A до следующего совпадения
     if (currentAIdx !== undefined && ai < currentAIdx) {
       if (aToken !== undefined) {
         pushChunk(aToken, 'removed');
@@ -199,7 +196,6 @@ function diffTokens(aText: string, bText: string): diffChunk[] {
       continue;
     }
 
-    // добавленные токены в B до следующего совпадения
     if (currentBIdx !== undefined && bi < currentBIdx) {
       if (bToken !== undefined) {
         pushChunk(bToken, 'added');
@@ -208,7 +204,6 @@ function diffTokens(aText: string, bText: string): diffChunk[] {
       continue;
     }
 
-    // хвостовые различия
     if (aToken !== undefined) {
       pushChunk(aToken, 'removed');
       ai += 1;
@@ -348,39 +343,51 @@ const afterEditor = useEditor({
   editable: false,
 });
 
-const beforeDocForView = computed<JSONContent | null>(() => {
-  const { before } = buildDiffDocs(props.beforeDoc, props.afterDoc);
-  return before;
-});
+// считаем diff один раз, а не два
+const diffDocs = computed(() => buildDiffDocs(props.beforeDoc, props.afterDoc));
 
-const afterDocForView = computed<JSONContent | null>(() => {
-  const { after } = buildDiffDocs(props.beforeDoc, props.afterDoc);
-  return after;
-});
-
-watch(
-  () => beforeDocForView.value,
-  (next) => {
-    if (beforeEditor?.value && next) {
-      beforeEditor.value.commands.setContent(next);
-    }
-  },
-  { immediate: true }
+const beforeDocForView = computed<JSONContent | null>(
+  () => diffDocs.value.before
+);
+const afterDocForView = computed<JSONContent | null>(
+  () => diffDocs.value.after
 );
 
-watch(
-  () => afterDocForView.value,
-  (next) => {
-    if (afterEditor?.value && next) {
-      afterEditor.value.commands.setContent(next);
-    }
-  },
-  { immediate: true }
-);
+// --------------------
+// Синхронизация редакторов с данными
+// --------------------
+
+watchEffect(() => {
+  const editor = beforeEditor.value;
+  const doc = beforeDocForView.value;
+
+  if (!editor) return;
+
+  if (!doc) {
+    editor.commands.clearContent();
+    return;
+  }
+
+  editor.commands.setContent(doc);
+});
+
+watchEffect(() => {
+  const editor = afterEditor.value;
+  const doc = afterDocForView.value;
+
+  if (!editor) return;
+
+  if (!doc) {
+    editor.commands.clearContent();
+    return;
+  }
+
+  editor.commands.setContent(doc);
+});
 
 onBeforeUnmount(() => {
-  beforeEditor?.value?.destroy();
-  afterEditor?.value?.destroy();
+  beforeEditor.value?.destroy();
+  afterEditor.value?.destroy();
 });
 </script>
 

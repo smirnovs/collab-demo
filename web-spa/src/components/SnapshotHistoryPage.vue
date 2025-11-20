@@ -1,7 +1,13 @@
 <template>
   <div class="container mx-auto max-w-6xl p-6 flex flex-col gap-4">
     <div class="flex items-center justify-between">
-      <h1 class="text-lg font-semibold">История изменений</h1>
+      <div>
+        <h1 class="text-lg font-semibold">История изменений</h1>
+        <p class="mt-1 text-xs text-gray-500">
+          (Сверху списка выберите вариант A — он будет слева, а внизу списка
+          выберите вариант B — он будет справа)
+        </p>
+      </div>
 
       <div class="flex gap-2">
         <button
@@ -46,7 +52,7 @@
               type="button"
               class="px-2 py-0.5 text-[10px] rounded border transition-colors"
               :class="
-                snap.id === selectedAId
+                snap.id === effectiveAId
                   ? 'border-blue-500 bg-blue-50'
                   : 'border-gray-300 hover:bg-gray-50'
               "
@@ -59,7 +65,7 @@
               type="button"
               class="px-2 py-0.5 text-[10px] rounded border transition-colors"
               :class="
-                snap.id === selectedBId
+                snap.id === effectiveBId
                   ? 'border-green-500 bg-green-50'
                   : 'border-gray-300 hover:bg-gray-50'
               "
@@ -74,6 +80,7 @@
 
     <div v-if="beforeDocForDiff && afterDocForDiff">
       <SnapshotDiffViewer
+        :key="`${effectiveAId}-${effectiveBId}`"
         :before-doc="beforeDocForDiff"
         :after-doc="afterDocForDiff"
       />
@@ -99,6 +106,8 @@ const snapshotsMap: Y.Map<snapshotEntry> =
   ydoc.getMap<snapshotEntry>('snapshots');
 
 const snapshotEntries = ref<snapshotEntry[]>([]);
+
+// Явный выбор пользователя (может быть null)
 const selectedAId = ref<string | null>(null);
 const selectedBId = ref<string | null>(null);
 
@@ -107,26 +116,27 @@ function updateSnapshotEntries(): void {
   snapshotsMap.forEach((value) => {
     list.push(value);
   });
+
+  // если createdAt — строка с ISO-датой, localeCompare ок
+  // если это число (timestamp), лучше привести к строке или сортировать как числа
   list.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
   snapshotEntries.value = list;
-
-  // если достаточно снапшотов и ещё ничего не выбрано —
-  // по умолчанию A = самый первый, B = самый последний
-  if (list.length >= 2) {
-    const first = list[0];
-    const last = list[list.length - 1];
-
-    if (first && !selectedAId.value) {
-      selectedAId.value = first.id;
-    }
-    if (last && !selectedBId.value) {
-      selectedBId.value = last.id;
-    }
-  } else {
-    selectedAId.value = null;
-    selectedBId.value = null;
-  }
 }
+
+// "Эффективный" A: либо выбранный, либо первый из списка
+const effectiveAId = computed<string | null>(() => {
+  if (selectedAId.value) return selectedAId.value;
+  const first = snapshotEntries.value[0];
+  return first ? first.id : null;
+});
+
+// "Эффективный" B: либо выбранный, либо последний из списка
+const effectiveBId = computed<string | null>(() => {
+  if (selectedBId.value) return selectedBId.value;
+  const last = snapshotEntries.value[snapshotEntries.value.length - 1];
+  return last ? last.id : null;
+});
 
 function selectSnapshotAsA(id: string): void {
   selectedAId.value = id;
@@ -148,6 +158,9 @@ const clearSnapshots = (): void => {
 };
 
 onMounted(() => {
+  // сбрасываем явный выбор и один раз подтягиваем данные
+  selectedAId.value = null;
+  selectedBId.value = null;
   updateSnapshotEntries();
 
   snapshotsObserver = () => {
@@ -164,15 +177,17 @@ onBeforeUnmount(() => {
   }
 });
 
+// Для диффа используем именно "эффективные" A/B,
+// чтобы по умолчанию сразу подставлялись первый/последний снапшоты
 const beforeDocForDiff = computed(() => {
-  if (!selectedAId.value) return null;
-  const snap = snapshotEntries.value.find((s) => s.id === selectedAId.value);
+  if (!effectiveAId.value) return null;
+  const snap = snapshotEntries.value.find((s) => s.id === effectiveAId.value);
   return snap ? snap.doc : null;
 });
 
 const afterDocForDiff = computed(() => {
-  if (!selectedBId.value) return null;
-  const snap = snapshotEntries.value.find((s) => s.id === selectedBId.value);
+  if (!effectiveBId.value) return null;
+  const snap = snapshotEntries.value.find((s) => s.id === effectiveBId.value);
   return snap ? snap.doc : null;
 });
 

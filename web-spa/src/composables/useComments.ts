@@ -187,16 +187,33 @@ function createCommentsPlugin(options: {
         _oldState: EditorState,
         newState: EditorState
       ) {
-        const meta = tr.getMeta(commentsPluginKey);
+        const meta = tr.getMeta(commentsPluginKey) as
+          | { type: string; id?: string }
+          | undefined;
 
+        const ySyncMeta = tr.getMeta('y-sync$');
+
+        // 1) Remote-update от Yjs: пересчитать всё из Y.Map
+        if (ySyncMeta) {
+          return createDecorations({
+            state: newState,
+            comments: options.getComments(),
+            activeCommentId: options.getActiveCommentId(),
+          });
+        }
+
+        // 2) Никаких изменений и без нашего meta → оставляем как есть
         if (!tr.docChanged && !meta) {
           return oldDecorationSet;
         }
 
+        // 3) Локальные изменения документа без нашего meta → можно мапить
         if (tr.docChanged && !meta) {
           return oldDecorationSet.map(tr.mapping, newState.doc);
         }
 
+        // 4) Наше meta (comments-updated / active-comment-changed и т.п.) →
+        //    пересчитываем из реактивных comments
         return createDecorations({
           state: newState,
           comments: options.getComments(),

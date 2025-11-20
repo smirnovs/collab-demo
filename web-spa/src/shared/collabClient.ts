@@ -4,6 +4,7 @@ import { HocuspocusProvider } from '@hocuspocus/provider';
 
 const documentName = 'demo-document-1';
 const hocuspocusUrl = 'ws://localhost:1234';
+// const hocuspocusUrl = 'wss://peace-mask-liked-categories.trycloudflare.com';
 
 let ydocSingleton: Y.Doc | null = null;
 let providerSingleton: HocuspocusProvider | null = null;
@@ -25,7 +26,7 @@ export function getCollabDoc(): {
   }
 
   return {
-    ydoc: ydocSingleton as Y.Doc,
-    provider: providerSingleton as HocuspocusProvider,
+    ydoc: ydocSingleton,
+    provider: providerSingleton,
   };
 }
