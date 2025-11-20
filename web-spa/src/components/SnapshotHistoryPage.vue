@@ -1,7 +1,7 @@
 <template>
   <div class="container mx-auto max-w-6xl p-6 flex flex-col gap-4">
     <div class="flex items-center justify-between">
-      <h1 class="text-lg font-semibold">История снапшотов</h1>
+      <h1 class="text-lg font-semibold">История изменений</h1>
 
       <div class="flex gap-2">
         <button
@@ -9,7 +9,7 @@
           class="px-3 py-1 rounded border text-xs font-medium transition-colors"
           @click="clearSnapshots"
         >
-          Очистить снапшоты
+          Очистить историю
         </button>
 
         <button
@@ -24,7 +24,7 @@
 
     <div class="border rounded-lg bg-white">
       <div class="px-3 py-2 text-xs font-medium text-gray-500 border-b">
-        Список снапшотов ({{ snapshotEntries.length }})
+        Список изменений ({{ snapshotEntries.length }})
       </div>
       <div class="max-h-48 overflow-auto text-xs">
         <div
@@ -37,7 +37,7 @@
               {{ new Date(snap.createdAt).toLocaleTimeString() }}
             </span>
             <span class="text-gray-500">
-              group: {{ snap.groupId.slice(0, 8) }}…, reason: {{ snap.reason }}
+              group: {{ snap.groupId.slice(0, 10) }}, reason: {{ snap.reason }}
             </span>
           </div>
 

@@ -7,6 +7,8 @@ import type { Editor as TiptapEditor } from '@tiptap/core';
 import type { Node as ProsemirrorNode } from '@tiptap/pm/model';
 import type { YMapEvent } from 'yjs';
 import * as Y from 'yjs';
+import { commentsPluginKey } from './useComments';
+import { proposedPluginKey } from './useProposals';
 
 export type ProsemirrorMapping = Map<
   Y.AbstractType<unknown>,
@@ -146,6 +148,25 @@ export function resolveAnchorRange(
     };
   } catch {
     return null;
+  }
+}
+
+export function refreshHighlights(ed: TiptapEditor | null | undefined): void {
+  if (!ed) return;
+
+  try {
+    const trComments = ed.state.tr.setMeta(commentsPluginKey, {
+      type: 'comments-updated',
+    });
+    ed.view.dispatch(trComments);
+
+    const trProposed = ed.state.tr.setMeta(proposedPluginKey, {
+      type: 'proposals-updated',
+    });
+    ed.view.dispatch(trProposed);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn('[highlight] failed to refresh decorations', error);
   }
 }
 

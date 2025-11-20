@@ -286,32 +286,23 @@
 </template>
 
 <script setup lang="ts">
+import * as Y from 'yjs';
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useEditor, EditorContent } from '@tiptap/vue-3';
 import StarterKit from '@tiptap/starter-kit';
 import Collaboration from '@tiptap/extension-collaboration';
 import CollaborationCaret from '@tiptap/extension-collaboration-caret';
-import { getCollabDoc } from '../shared/collabClient';
-import * as Y from 'yjs';
 import {
   ySyncPluginKey,
   absolutePositionToRelativePosition,
 } from '@tiptap/y-tiptap';
 import type { Node as ProsemirrorNode } from '@tiptap/pm/model';
-import {
-  Plugin,
-  PluginKey,
-  type EditorState,
-  type Transaction,
-} from '@tiptap/pm/state';
-import { Decoration, DecorationSet } from '@tiptap/pm/view';
-import type { EditorView } from '@tiptap/pm/view';
-import { Extension } from '@tiptap/core';
+import type { Transaction } from '@tiptap/pm/state';
 import type { Editor as TiptapEditor } from '@tiptap/core';
-import { useHistory } from '../composables/useHistory';
-import type { historyEntry } from '../types/historyTypes';
+import { Extension } from '@tiptap/core';
 import { useSnapshots } from '../composables/useSnapshots';
-import type { snapshotEntry } from '../types/snapshotTypes';
+import { useHistory } from '../composables/useHistory';
+import { getCollabDoc } from '../shared/collabClient';
 import {
   createRandomUser,
   createCollabId,
@@ -319,19 +310,17 @@ import {
   getDocTextRange,
   resolveAnchorRange,
   getYSyncStateFromEditor,
+  refreshHighlights,
 } from '../composables/useCollabHelpers';
 
 import { useComments, commentsPluginKey } from '../composables/useComments';
+import { useProposals, proposedPluginKey } from '../composables/useProposals';
 import type { commentAnchor } from '../composables/useComments';
-
+import type { historyEntry } from '../types/historyTypes';
+import type { snapshotEntry } from '../types/snapshotTypes';
 // --------------------
 // Типы
 // --------------------
-
-type ProsemirrorMapping = Map<
-  Y.AbstractType<unknown>,
-  ProsemirrorNode | ProsemirrorNode[]
->;
 
 type proposedChangeStatus = 'pending' | 'approved';
 type proposedChangeKind = 'insert' | 'delete';
@@ -355,25 +344,6 @@ interface awarenessUser {
   name: string;
   color: string;
   isLocal: boolean;
-}
-
-interface YSyncBinding {
-  mapping: ProsemirrorMapping;
-}
-
-interface YSyncState {
-  doc: Y.Doc;
-  type: Y.XmlFragment;
-  binding: YSyncBinding;
-}
-
-interface textRangeBlocked {
-  from: number;
-  to: number;
-}
-
-function rangesIntersect(a: textRangeBlocked, b: textRangeBlocked): boolean {
-  return a.from < b.to && a.to > b.from;
 }
 
 // --------------------
@@ -419,11 +389,25 @@ const {
   getEditor: () => editor.value,
 });
 
-// Y.Map для комментариев — единый источник правды
-// const commentsMap: Y.Map<commentData> = ydoc.getMap<commentData>('comments');
-
-const proposedChangesMap: Y.Map<proposedChangeData> =
-  ydoc.getMap<proposedChangeData>('proposedChanges');
+const {
+  proposedChanges,
+  editorMode,
+  isCommentOnly,
+  activeProposalId,
+  proposedChangesMap,
+  proposedHighlightExtension,
+  blockInsertInDeleteExtension,
+  updateProposedChangesFromYjs,
+  setEditorMode,
+  focusProposalById,
+  approveProposedChange,
+  deleteProposedChange,
+} = useProposals({
+  ydoc,
+  history,
+  getEditor: () => editor.value,
+  hideSelectionPopup,
+});
 
 // История изменений
 const historyMap: Y.Map<historyEntry> = ydoc.getMap<historyEntry>('history');
@@ -453,32 +437,7 @@ const historyView = computed(() =>
 );
 
 // --------------------
-// Vue-реактивный список предложенных изменений + режим редактора
-// --------------------
-
-const proposedChanges = ref<proposedChangeData[]>([]);
-const editorMode = ref<'edit' | 'propose'>('edit');
-const isCommentOnly = ref<boolean>(false);
-const activeProposalId = ref<string | null>(null);
-
-function updateProposedChangesFromYjs(): void {
-  const next: proposedChangeData[] = [];
-  proposedChangesMap.forEach((value) => {
-    next.push(value);
-  });
-  proposedChanges.value = next;
-}
-
-function setEditorMode(mode: 'edit' | 'propose'): void {
-  editorMode.value = mode;
-  // при переключении режима текущий активный proposal сбрасывается,
-  // чтобы новый ввод создавал новое предложение
-  activeProposalId.value = null;
-  hideSelectionPopup();
-}
-
-// --------------------
-// Vue-реактивный список онлайн-пользователей (awareness)
+// реактивный список онлайн-пользователей (awareness)
 // --------------------
 
 const onlineUsers = ref<awarenessUser[]>([]);
@@ -509,53 +468,6 @@ function updateOnlineUsersFromStates(
   });
 
   onlineUsers.value = result;
-}
-
-// --------------------
-// ProseMirror Plugin для подсветки диапазонов комментариев
-// --------------------
-
-function focusProposalById(id: string): void {
-  activeProposalId.value = id;
-
-  const ed = editor.value;
-  if (!ed) return;
-
-  const proposal = proposedChanges.value.find((p) => p.id === id);
-  if (!proposal) return;
-
-  const yState = getYSyncStateFromEditor(editor.value);
-  if (!yState) return;
-
-  try {
-    const range = resolveAnchorRange(proposal.anchor, yState);
-    if (!range) return;
-
-    const { from } = range;
-    ed.view.focus();
-
-    const domPos = ed.view.domAtPos(from);
-    let target: HTMLElement | null = null;
-
-    if (domPos.node.nodeType === Node.TEXT_NODE) {
-      target = domPos.node.parentElement;
-    } else if (domPos.node instanceof HTMLElement) {
-      target = domPos.node;
-    }
-
-    if (target) {
-      target.scrollIntoView({ block: 'center' });
-    }
-
-    const tr = ed.state.tr.setMeta(proposedPluginKey, {
-      type: 'active-proposal-changed',
-      id,
-    });
-    ed.view.dispatch(tr);
-  } catch (error) {
-    // eslint-disable-next-line no-console
-    console.warn('[proposed] failed to focus proposal', id, error);
-  }
 }
 
 function handleEditorUpdate(params: {
@@ -667,7 +579,8 @@ function handleEditorUpdate(params: {
     let reusedExisting = false;
     const currentId = activeProposalId.value;
 
-    // Попытка расширить текущий активный proposal, если вставка попадает внутрь него
+    // Попытка расширить текущий активный proposal, если вставка
+    // пересекается или соседствует с его диапазоном
     if (currentId) {
       const existing = proposedChangesMap.get(currentId);
       if (
@@ -677,35 +590,46 @@ function handleEditorUpdate(params: {
       ) {
         try {
           const existingRange = resolveAnchorRange(existing.anchor, yState);
-          if (
-            existingRange &&
-            startNew >= existingRange.from &&
-            startNew <= existingRange.to
-          ) {
-            const newAnchor: commentAnchor = {
-              // старт оставляем как есть, чтобы не дёргать якорь
-              start: existing.anchor.start,
-              end: relativePositionToBase64(
-                absolutePositionToRelativePosition(
-                  endNew,
-                  yState.type,
-                  yState.binding.mapping
-                ) as Y.RelativePosition
-              ),
-            };
+          if (existingRange) {
+            const areAdjacentOrOverlap =
+              endNew >= existingRange.from - 1 &&
+              startNew <= existingRange.to + 1;
 
-            const mergedText = getDocTextRange(doc, existingRange.from, endNew);
+            if (areAdjacentOrOverlap) {
+              const mergedFrom = Math.min(existingRange.from, startNew);
+              const mergedTo = Math.max(existingRange.to, endNew);
 
-            const updated: proposedChangeData = {
-              ...existing,
-              anchor: newAnchor,
-              text: mergedText,
-            };
+              const mergedStartRel = absolutePositionToRelativePosition(
+                mergedFrom,
+                yState.type,
+                yState.binding.mapping
+              );
+              const mergedEndRel = absolutePositionToRelativePosition(
+                mergedTo,
+                yState.type,
+                yState.binding.mapping
+              );
 
-            proposedChangesMap.set(currentId, updated);
-            history.updateProposalInsertText(currentId, mergedText);
+              if (mergedStartRel && mergedEndRel) {
+                const newAnchor: commentAnchor = {
+                  start: relativePositionToBase64(mergedStartRel),
+                  end: relativePositionToBase64(mergedEndRel),
+                };
 
-            reusedExisting = true;
+                const mergedText = getDocTextRange(doc, mergedFrom, mergedTo);
+
+                const updated = {
+                  ...existing,
+                  anchor: newAnchor,
+                  text: mergedText,
+                };
+
+                proposedChangesMap.set(currentId, updated);
+                history.updateProposalInsertText(currentId, mergedText);
+
+                reusedExisting = true;
+              }
+            }
           }
         } catch (error) {
           // eslint-disable-next-line no-console
@@ -785,9 +709,76 @@ function handleDeleteKey(
   const { state } = ed;
   const { from, to, empty } = state.selection;
 
-  // 1) Если уже есть выделенный диапазон — помечаем его как "предложение удаления".
-  //    Курсор и выделение остаются как есть (поведение, о котором договаривались ранее).
+  // Удаление внутри pending insert-proposal:
+  // - реально удаляет текст;
+  // - обновляет текст proposal;
+  // - не создаёт delete-proposal.
+  function deleteInsideInsertProposal(delFrom: number, delTo: number): boolean {
+    if (delFrom >= delTo) return false;
+
+    const yStateBefore = getYSyncStateFromEditor(ed);
+    if (!yStateBefore) return false;
+
+    let targetId: string | null = null;
+    let targetChange: proposedChangeData | undefined;
+
+    // Ищем pending insert, внутри которого полностью лежит диапазон удаления
+    proposedChangesMap.forEach((change, id) => {
+      if (targetId) return;
+      if (change.status !== 'pending' || change.kind !== 'insert') return;
+
+      const range = resolveAnchorRange(change.anchor, yStateBefore);
+      if (!range) return;
+
+      if (delFrom >= range.from && delTo <= range.to) {
+        targetId = id;
+        targetChange = change;
+      }
+    });
+
+    if (!targetId || !targetChange) {
+      return false;
+    }
+
+    // 1) Реально удаляем текст из документа
+    ed.chain().deleteRange({ from: delFrom, to: delTo }).run();
+
+    const yStateAfter = getYSyncStateFromEditor(ed);
+    if (!yStateAfter) {
+      return true; // текст уже удалён, proposal хотя бы не сломается
+    }
+
+    const newRange = resolveAnchorRange(targetChange.anchor, yStateAfter);
+    if (!newRange) {
+      return true;
+    }
+
+    const newDoc = ed.state.doc as ProsemirrorNode;
+    const newText = getDocTextRange(newDoc, newRange.from, newRange.to);
+
+    const updated: proposedChangeData = {
+      ...targetChange,
+      text: newText,
+    };
+
+    ydoc.transact(() => {
+      proposedChangesMap.set(targetId as string, updated);
+      history.updateProposalInsertText(targetId as string, newText);
+    });
+
+    return true;
+  }
+
+  // 1) Есть выделение
   if (!empty) {
+    // Если удаляемый диапазон целиком внутри вставки — просто удаляем и обновляем insert-proposal
+    if (deleteInsideInsertProposal(from, to)) {
+      // Можно оставить курсор на начале диапазона (поведение Backspace/Delete с выделением)
+      ed.chain().setTextSelection(from).run();
+      return true;
+    }
+
+    // Иначе — обычное поведение: создаём delete-proposal по выделению
     const created = createDeletionProposal(from, to, ed);
     if (!created) return false;
 
@@ -795,9 +786,7 @@ function handleDeleteKey(
     return true;
   }
 
-  // 2) Если выделения нет — работаем по одной букве.
-  //    Буква НЕ выделяется, только подсвечивается, а декоратор растягивается
-  //    при последующих нажатиях Backspace/Delete.
+  // 2) Нет выделения — работаем по одной букве
   const docSize = state.doc.content.size;
   let start: number;
   let end: number;
@@ -816,13 +805,19 @@ function handleDeleteKey(
     end = from + 1;
   }
 
+  // Если удаляемая буква лежит целиком внутри вставки — удаляем её и сужаем insert-proposal
+  if (deleteInsideInsertProposal(start, end)) {
+    const collapsePos = direction === 'backward' ? start : end;
+    ed.chain().setTextSelection(collapsePos).run();
+    return true;
+  }
+
+  // Вне вставки — создаём delete-proposal, как и раньше
   const created = createDeletionProposal(start, end, ed);
   if (!created) return false;
 
   const collapsePos = direction === 'backward' ? start : end;
 
-  // Курсор двигается, но выделения нет (selection пустой),
-  // подсветка управляется исключительно декорациями.
   ed.chain().setTextSelection(collapsePos).run();
 
   return true;
@@ -967,314 +962,6 @@ function createDeletionProposal(
   return true;
 }
 
-const proposedPluginKey = new PluginKey<DecorationSet>('proposed-plugin');
-
-function createProposedDecorations(params: {
-  state: EditorState;
-  changes: proposedChangeData[];
-  activeProposalId: string | null;
-}): DecorationSet {
-  const { state, changes, activeProposalId } = params;
-
-  const raw = ySyncPluginKey.getState(state) as
-    | (YSyncState & { binding: YSyncBinding | null })
-    | null
-    | undefined;
-
-  if (!raw || !raw.doc || !raw.type || !raw.binding || !raw.binding.mapping) {
-    return DecorationSet.empty;
-  }
-
-  const yState = raw as YSyncState;
-  const decorations: Decoration[] = [];
-
-  for (const change of changes) {
-    if (change.status !== 'pending') continue;
-
-    const range = resolveAnchorRange(change.anchor, yState);
-    if (!range) {
-      continue;
-    }
-
-    const { from, to } = range;
-    const classNames = ['tiptap-proposed-mark'];
-
-    if (change.kind === 'delete') {
-      classNames.push('tiptap-proposed-mark-delete');
-    } else {
-      classNames.push('tiptap-proposed-mark-insert');
-    }
-
-    const isActive = change.id === activeProposalId;
-    if (isActive) {
-      classNames.push('tiptap-proposed-mark-selected');
-    }
-
-    decorations.push(
-      Decoration.inline(
-        from,
-        to,
-        {
-          class: classNames.join(' '),
-          'data-proposed-id': change.id,
-        },
-        { proposalId: change.id }
-      )
-    );
-  }
-
-  if (decorations.length === 0) {
-    return DecorationSet.empty;
-  }
-
-  return DecorationSet.create(state.doc, decorations);
-}
-
-function createProposedPlugin(): Plugin<DecorationSet> {
-  return new Plugin<DecorationSet>({
-    key: proposedPluginKey,
-    state: {
-      init(_, state) {
-        return createProposedDecorations({
-          state,
-          changes: proposedChanges.value,
-          activeProposalId: activeProposalId.value,
-        });
-      },
-      apply(
-        tr: Transaction,
-        oldDecorationSet: DecorationSet,
-        _oldState: EditorState,
-        newState: EditorState
-      ) {
-        const meta = tr.getMeta(proposedPluginKey);
-
-        if (!tr.docChanged && !meta) {
-          return oldDecorationSet;
-        }
-
-        // Обычный ввод/удаление текста — просто мапим существующие декорации
-        if (tr.docChanged && !meta) {
-          return oldDecorationSet.map(tr.mapping, newState.doc);
-        }
-
-        // Есть meta (обновлены proposals / сменился активный) —
-        // пересоздаём декорации через Y-анкеры
-        return createProposedDecorations({
-          state: newState,
-          changes: proposedChanges.value,
-          activeProposalId: activeProposalId.value,
-        });
-      },
-    },
-    props: {
-      decorations(state) {
-        return proposedPluginKey.getState(state) ?? null;
-      },
-      handleClick(view: EditorView, pos: number): boolean {
-        const decoSet = proposedPluginKey.getState(view.state);
-        if (!decoSet) return false;
-
-        const found = decoSet.find(pos, pos);
-        if (found.length === 0) return false;
-
-        const deco = found[0];
-        if (!deco) return false;
-
-        const spec = deco.spec as { proposalId?: string } | undefined;
-        const proposalId =
-          spec?.proposalId ??
-          (deco.spec as { 'data-proposed-id'?: string })['data-proposed-id'];
-
-        if (!proposalId || typeof proposalId !== 'string') {
-          return false;
-        }
-
-        activeProposalId.value = proposalId;
-
-        const card = document.querySelector<HTMLElement>(
-          `[data-proposal-card-id="${proposalId}"]`
-        );
-        if (card) {
-          card.scrollIntoView({ block: 'nearest' });
-        }
-
-        const tr = view.state.tr.setMeta(proposedPluginKey, {
-          type: 'active-proposal-changed',
-          id: proposalId,
-        });
-        view.dispatch(tr);
-
-        return true;
-      },
-    },
-  });
-}
-
-const proposedHighlightExtension = Extension.create({
-  name: 'proposedHighlight',
-  addProseMirrorPlugins() {
-    return [createProposedPlugin()];
-  },
-});
-
-const blockInsertInDeleteExtension = Extension.create({
-  name: 'blockInsertInDelete',
-  addProseMirrorPlugins() {
-    return [
-      new Plugin({
-        key: new PluginKey('block-insert-in-delete'),
-        filterTransaction(tr: Transaction, state: EditorState): boolean {
-          // 0) Ничего не делает документ — пропускаем
-          if (!tr.docChanged) {
-            return true;
-          }
-
-          // 1) Транзакции, пришедшие из Yjs (другие клиенты / undo / history),
-          // не должны блокироваться этим плагином, иначе можно "ломать" синхронизацию.
-          const isYChangeOrigin = !!tr.getMeta(ySyncPluginKey);
-          if (isYChangeOrigin) {
-            return true;
-          }
-
-          const selection = state.selection;
-
-          // 2) Разбираем шаги транзакции: есть ли вставка / удаление и какие диапазоны меняются
-          let hasInsertion = false;
-          const insertionSpans: textRangeBlocked[] = [];
-          const changeSpans: textRangeBlocked[] = [];
-
-          tr.steps.forEach((step) => {
-            const s = step as unknown as {
-              from?: number;
-              to?: number;
-              slice?: { size: number };
-            };
-
-            const from = typeof s.from === 'number' ? (s.from as number) : null;
-            const to = typeof s.to === 'number' ? (s.to as number) : null;
-            const sliceSize =
-              s.slice && typeof s.slice.size === 'number'
-                ? (s.slice.size as number)
-                : 0;
-
-            // ВСТАВКА (в том числе часть replace-шага)
-            if (sliceSize > 0 && from !== null) {
-              hasInsertion = true;
-
-              const mappedFrom = tr.mapping.map(from, -1);
-              const insFrom = mappedFrom;
-              const insTo = mappedFrom + sliceSize;
-
-              const span: textRangeBlocked = { from: insFrom, to: insTo };
-              insertionSpans.push(span);
-              changeSpans.push(span);
-            }
-
-            // УДАЛЕНИЕ / ЗАМЕНА (to > from)
-            if (from !== null && to !== null && to > from) {
-              const delFrom = tr.mapping.map(from, -1);
-              const delTo = tr.mapping.map(to, 1);
-
-              changeSpans.push({ from: delFrom, to: delTo });
-            }
-          });
-
-          if (changeSpans.length === 0) {
-            // Ничего содержательного не меняем (например, только курсор) — пропускаем
-            return true;
-          }
-
-          // 3) Получаем Y-состояние, чтобы распаковать якоря предложений в абсолютные координаты
-          const raw = ySyncPluginKey.getState(state) as
-            | (YSyncState & { binding: YSyncBinding | null })
-            | null
-            | undefined;
-
-          if (
-            !raw ||
-            !raw.doc ||
-            !raw.type ||
-            !raw.binding ||
-            !raw.binding.mapping
-          ) {
-            return true;
-          }
-
-          const yState = raw as YSyncState;
-
-          const pendingChanges = proposedChanges.value.filter(
-            (change) => change.status === 'pending'
-          );
-
-          if (pendingChanges.length === 0) {
-            // Нет ни одного активного предложения — нечего блокировать
-            return true;
-          }
-
-          const allProposalRanges: textRangeBlocked[] = [];
-          const deleteRanges: textRangeBlocked[] = [];
-
-          for (const change of pendingChanges) {
-            const range = resolveAnchorRange(change.anchor, yState);
-            if (!range) continue;
-
-            const normalized: textRangeBlocked = {
-              from: range.from,
-              to: range.to,
-            };
-
-            allProposalRanges.push(normalized);
-
-            if (change.kind === 'delete') {
-              deleteRanges.push(normalized);
-            }
-          }
-
-          // 4) Логика для разных режимов редактора
-
-          // --- Свободный режим: НЕЛЬЗЯ редактировать текст внутри любых предложений ---
-          if (editorMode.value === 'edit') {
-            for (const span of changeSpans) {
-              if (allProposalRanges.some((r) => rangesIntersect(span, r))) {
-                // Любая вставка/удаление, пересекающая диапазон предложения, запрещена
-                return false;
-              }
-            }
-            return true;
-          }
-
-          // --- Режим предложений ---
-          if (editorMode.value === 'propose') {
-            // 4.1) Если есть выделение И есть вставка — блокируем печать/вставку.
-            // Это запрещает ввод текста поверх выделенного диапазона в режиме propose.
-            if (!selection.empty && hasInsertion) {
-              return false;
-            }
-
-            // 4.2) Если вставки нет или нет delete-диапазонов — дальше нечего блокировать.
-            if (!hasInsertion || deleteRanges.length === 0) {
-              return true;
-            }
-
-            // 4.3) Блокируем вставку, пересекающую диапазон "delete"-предложений.
-            for (const span of insertionSpans) {
-              if (deleteRanges.some((r) => rangesIntersect(span, r))) {
-                return false;
-              }
-            }
-
-            return true;
-          }
-
-          // На всякий случай — для неизвестных режимов ничего не блокируем
-          return true;
-        },
-      }),
-    ];
-  },
-});
-
 const proposedDeletionExtension = Extension.create({
   name: 'proposedDeletion',
   addKeyboardShortcuts() {
@@ -1315,25 +1002,6 @@ const proposedDeletionExtension = Extension.create({
     };
   },
 });
-function refreshHighlights(): void {
-  const ed = editor.value;
-  if (!ed) return;
-
-  try {
-    const trComments = ed.state.tr.setMeta(commentsPluginKey, {
-      type: 'comments-updated',
-    });
-    ed.view.dispatch(trComments);
-
-    const trProposed = ed.state.tr.setMeta(proposedPluginKey, {
-      type: 'proposals-updated',
-    });
-    ed.view.dispatch(trProposed);
-  } catch (error) {
-    // eslint-disable-next-line no-console
-    console.warn('[highlight] failed to refresh decorations', error);
-  }
-}
 
 // --------------------
 // Tiptap Editor + Collaboration + CollaborationCaret
@@ -1370,7 +1038,7 @@ const editor = useEditor({
     updateProposedChangesFromYjs();
 
     // 2. Насильно дернуть плагины подсветки, чтобы они пересчитали декорации
-    refreshHighlights();
+    refreshHighlights(editor.value);
   },
   onUpdate: handleEditorUpdate,
   onSelectionUpdate: handleSelectionUpdate,
@@ -1391,8 +1059,6 @@ const toggleOnlyComments = () => {
   isCommentOnly.value = !isCommentOnly.value;
   editor.value?.setEditable(!isCommentOnly.value);
 };
-
-// const addText = ref<string>('');
 
 let awarenessChangeHandler:
   | ((payload: {
@@ -1430,7 +1096,7 @@ onMounted(() => {
     updateCommentsFromYjs();
     updateProposedChangesFromYjs();
 
-    refreshHighlights();
+    refreshHighlights(editor.value);
   });
 
   // Подписка на изменения списка пользователей
@@ -1499,7 +1165,7 @@ onMounted(() => {
     } else if (document.visibilityState === 'visible') {
       // при возврате на вкладку заставляем плагины подсветки
       // пересоздать декорации на основе актуальных Y-состояний
-      refreshHighlights();
+      refreshHighlights(editor.value);
     }
   };
 
@@ -1551,96 +1217,6 @@ onBeforeUnmount(() => {
 
   editor.value?.destroy();
 });
-
-const approveProposedChange = (id: string): void => {
-  const change = proposedChangesMap.get(id);
-  if (!change) return;
-
-  const ed = editor.value;
-
-  // Для kind === 'delete' по "Принять" удаляем текст из документа,
-  // но карточку оставляем (меняется только статус).
-  if (ed && change.kind === 'delete') {
-    const yState = getYSyncStateFromEditor(editor.value);
-    if (yState) {
-      const range = resolveAnchorRange(change.anchor, yState);
-      if (range) {
-        try {
-          ed.chain().focus().deleteRange(range).run();
-        } catch (error) {
-          // eslint-disable-next-line no-console
-          console.warn(
-            '[proposed] failed to apply delete on approve',
-            id,
-            error
-          );
-        }
-      }
-    }
-  }
-
-  const updated: proposedChangeData = {
-    ...change,
-    status: 'approved',
-  };
-
-  ydoc.transact(() => {
-    proposedChangesMap.set(id, updated);
-  });
-
-  if (activeProposalId.value === id) {
-    activeProposalId.value = null;
-  }
-
-  if (change.kind === 'insert') {
-    history.logProposalInsertApproved(id, change.text);
-  } else {
-    history.logProposalDeleteApproved(id, change.text);
-  }
-};
-
-const deleteProposedChange = (id: string): void => {
-  const ed = editor.value;
-  const change = proposedChangesMap.get(id);
-  if (!change) return;
-
-  // Для pending + kind === 'insert' "Удалить" ведёт себя как раньше:
-  // реально убирает вставленный диапазон из документа.
-  // Для kind === 'delete' текст НЕ трогаем, только карточку.
-  // Для любых approved-предложений — тоже только удаляем карточку.
-  if (ed && change.status === 'pending' && change.kind === 'insert') {
-    const yState = getYSyncStateFromEditor(editor.value);
-    if (yState) {
-      const range = resolveAnchorRange(change.anchor, yState);
-      if (range) {
-        try {
-          ed.chain().focus().deleteRange(range).run();
-        } catch (error) {
-          // eslint-disable-next-line no-console
-          console.warn(
-            '[proposed] failed to delete range for insert proposal',
-            id,
-            error
-          );
-        }
-      }
-    }
-  }
-
-  ydoc.transact(() => {
-    proposedChangesMap.delete(id);
-  });
-
-  if (activeProposalId.value === id) {
-    activeProposalId.value = null;
-  }
-
-  if (change.kind === 'insert') {
-    history.logProposalInsertDeleted(id, change.text);
-  } else {
-    history.logProposalDeleteDeleted(id, change.text);
-  }
-};
 
 const clearHistory = (): void => {
   ydoc.transact(() => {
