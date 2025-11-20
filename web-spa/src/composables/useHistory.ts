@@ -2,10 +2,9 @@
 import * as Y from 'yjs';
 import type {
   historyEntry,
-  historyTextPayload,
   historyProposalPayload,
-} from '../historyTypes';
-import { HistoryKind } from '../historyTypes';
+} from '../types/historyTypes';
+import { HistoryKind } from '../types/historyTypes';
 
 interface historyUser {
   name: string;
@@ -15,14 +14,6 @@ interface historyInitOptions {
   ydoc: Y.Doc;
   currentUser: historyUser;
 }
-
-interface textRange {
-  from: number;
-  to: number;
-}
-
-let lastInsertEntry: { id: string; range: textRange } | null = null;
-let lastDeleteEntry: { id: string; range: textRange } | null = null;
 
 function createId(): string {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -230,113 +221,6 @@ export function useHistory(options: historyInitOptions) {
     });
   }
 
-  // --------------------
-  // Текст: вставка / удаление с группировкой
-  // --------------------
-
-  function canMergeRanges(prev: textRange, next: textRange): boolean {
-    // "рядом или пересекаются"
-    return (
-      next.from <= prev.to && next.from >= prev.from && next.from <= prev.to + 1
-    );
-  }
-
-  function logTextInserted(range: textRange, text: string): void {
-    if (!text || range.from >= range.to) return;
-
-    if (lastInsertEntry && canMergeRanges(lastInsertEntry.range, range)) {
-      const existing = historyMap.get(lastInsertEntry.id);
-      if (existing && existing.kind === HistoryKind.TextInserted) {
-        const payload = existing.payload as historyTextPayload;
-
-        const updated: historyEntry = {
-          ...existing,
-          payload: {
-            ...payload,
-            text: payload.text + text,
-          },
-        };
-
-        ydoc.transact(() => {
-          historyMap.set(existing.id, updated);
-        });
-
-        lastInsertEntry = {
-          id: existing.id,
-          range: {
-            from: lastInsertEntry.range.from,
-            to: range.to,
-          },
-        };
-
-        return;
-      }
-    }
-
-    const entry = pushEntry({
-      kind: HistoryKind.TextInserted,
-      payload: {
-        text,
-      },
-    });
-
-    lastInsertEntry = {
-      id: entry.id,
-      range,
-    };
-  }
-
-  function logTextDeleted(range: textRange, text: string): void {
-    if (!text || range.from >= range.to) return;
-
-    if (lastDeleteEntry && canMergeRanges(lastDeleteEntry.range, range)) {
-      const existing = historyMap.get(lastDeleteEntry.id);
-      if (existing && existing.kind === HistoryKind.TextDeleted) {
-        const payload = existing.payload as historyTextPayload;
-
-        const updated: historyEntry = {
-          ...existing,
-          payload: {
-            ...payload,
-            text: payload.text + text,
-          },
-        };
-
-        ydoc.transact(() => {
-          historyMap.set(existing.id, updated);
-        });
-
-        lastDeleteEntry = {
-          id: existing.id,
-          range: {
-            from: lastDeleteEntry.range.from,
-            to: range.to,
-          },
-        };
-
-        return;
-      }
-    }
-
-    const entry = pushEntry({
-      kind: HistoryKind.TextDeleted,
-      payload: {
-        text,
-      },
-    });
-
-    lastDeleteEntry = {
-      id: entry.id,
-      range,
-    };
-  }
-
-  // вызывать при заметном изменении курсора или явном разрыве "набора абзаца"
-  function resetTextHistoryGrouping(): void {
-    lastInsertEntry = null;
-    lastDeleteEntry = null;
-  }
-
   return {
     logCommentCreated,
     logCommentResolved,
@@ -347,9 +231,6 @@ export function useHistory(options: historyInitOptions) {
     logProposalDeleteCreated,
     logProposalDeleteApproved,
     logProposalDeleteDeleted,
-    logTextInserted,
-    logTextDeleted,
-    resetTextHistoryGrouping,
     updateProposalInsertText,
     updateProposalDeleteText,
   };

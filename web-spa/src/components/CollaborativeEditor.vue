@@ -39,6 +39,14 @@
           Только комментирование
         </button>
       </div>
+      <div class="flex gap-3 mb-3">
+        <RouterLink
+          to="/history"
+          class="px-3 py-1 rounded border text-xs font-medium transition-colors bg-green-200"
+        >
+          История
+        </RouterLink>
+      </div>
 
       <!-- Онлайн-пользователи -->
       <div class="mb-3 flex items-center gap-2 text-xs text-gray-600">
@@ -283,7 +291,7 @@ import { useEditor, EditorContent } from '@tiptap/vue-3';
 import StarterKit from '@tiptap/starter-kit';
 import Collaboration from '@tiptap/extension-collaboration';
 import CollaborationCaret from '@tiptap/extension-collaboration-caret';
-import { HocuspocusProvider } from '@hocuspocus/provider';
+import { getCollabDoc } from '../shared/collabClient';
 import * as Y from 'yjs';
 import {
   ySyncPluginKey,
@@ -302,7 +310,10 @@ import type { EditorView } from '@tiptap/pm/view';
 import { Extension } from '@tiptap/core';
 import type { Editor as TiptapEditor } from '@tiptap/core';
 import { useHistory } from '../composables/useHistory';
-import type { historyEntry } from '../historyTypes';
+import type { historyEntry } from '../types/historyTypes';
+import { useSnapshots } from '../composables/useSnapshots';
+import type { snapshotEntry } from '../types/snapshotTypes';
+
 // --------------------
 // Типы
 // --------------------
@@ -370,6 +381,10 @@ interface YSyncState {
 // Генерация пользователя (один случайный юзер на вкладку)
 // --------------------
 
+let snapshotIntervalId: number | null = null;
+
+let visibilityChangeHandler: (() => void) | null = null;
+
 function createRandomColor(): string {
   const hue = Math.floor(Math.random() * 360);
   return `hsl(${hue} 80% 60%)`;
@@ -389,15 +404,17 @@ const currentUser: collabUser = createRandomUser();
 // Yjs + Hocuspocus
 // --------------------
 
-const documentName = 'demo-document-1';
-const hocuspocusUrl = 'ws://localhost:1234';
+// const documentName = 'demo-document-1';
+// const hocuspocusUrl = 'ws://localhost:1234';
 
-const provider = new HocuspocusProvider({
-  url: hocuspocusUrl,
-  name: documentName,
-});
+// const provider = new HocuspocusProvider({
+//   url: hocuspocusUrl,
+//   name: documentName,
+// });
 
-const ydoc = provider.document as Y.Doc;
+// const ydoc = provider.document as Y.Doc;
+
+const { ydoc, provider } = getCollabDoc();
 
 const history = useHistory({
   ydoc,
@@ -795,7 +812,6 @@ function handleSelectionUpdate(params: { editor: TiptapEditor }): void {
   } catch {
     hideSelectionPopup();
   }
-  history.resetTextHistoryGrouping();
 }
 
 function handleEditorUpdate(params: {
@@ -1132,6 +1148,10 @@ function createDeletionProposal(
                 };
 
                 proposedChangesMap.set(currentId, updated);
+                history.updateProposalDeleteText(currentId, newText);
+                // если нужно, можно отдельно добавить history.updateProposalDeleteText(...)
+                // но для TextDeleted группировка уже реализована через logTextDeleted выше
+
                 merged = true;
               }
             }
@@ -1455,97 +1475,6 @@ const proposedHighlightExtension = Extension.create({
   },
 });
 
-const textHistoryPluginKey = new PluginKey('text-history-plugin');
-
-const textHistoryExtension = Extension.create({
-  name: 'textHistory',
-  addProseMirrorPlugins() {
-    return [
-      new Plugin({
-        key: textHistoryPluginKey,
-        apply(
-          tr: Transaction,
-          value: unknown,
-          oldState: EditorState,
-          newState: EditorState
-        ) {
-          if (!tr.docChanged) {
-            return value;
-          }
-
-          const addToHistoryMeta = tr.getMeta('addToHistory');
-          if (addToHistoryMeta === false) {
-            return value;
-          }
-
-          // режим propose обрабатывается через proposals, а не через TextInserted/TextDeleted
-          if (editorMode.value === 'propose') {
-            return value;
-          }
-
-          const oldDoc = oldState.doc as ProsemirrorNode;
-          const newDoc = newState.doc as ProsemirrorNode;
-
-          tr.steps.forEach((step) => {
-            const s = step as unknown as {
-              from?: number;
-              to?: number;
-              slice?: { size: number };
-            };
-
-            if (typeof s.from !== 'number' || typeof s.to !== 'number') {
-              return;
-            }
-
-            const sliceSize = s.slice?.size ?? 0;
-
-            const isDelete = s.to > s.from && sliceSize === 0;
-            const isInsert = sliceSize > 0 && s.from === s.to;
-            const isReplace = s.to > s.from && sliceSize > 0;
-
-            // --- УДАЛЕНИЕ и delete-часть replace ---
-            if (isDelete || isReplace) {
-              const delFrom = s.from;
-              const delTo = s.to;
-
-              const deletedText = oldDoc.textBetween(delFrom, delTo, '\n');
-              if (deletedText) {
-                // можно логировать диапазон, если это нужно
-                history.logTextDeleted(
-                  { from: delFrom, to: delTo },
-                  deletedText
-                );
-              }
-            }
-
-            // --- ВСТАВКА и insert-часть replace ---
-            if (isInsert || isReplace) {
-              // позиция вставки в НОВОМ документе
-              const insertFromNew = tr.mapping.map(s.from, 1);
-              const insertToNew = insertFromNew + sliceSize;
-
-              const insertedText = newDoc.textBetween(
-                insertFromNew,
-                insertToNew,
-                '\n'
-              );
-
-              if (insertedText) {
-                history.logTextInserted(
-                  { from: insertFromNew, to: insertToNew },
-                  insertedText
-                );
-              }
-            }
-          });
-
-          return value;
-        },
-      }),
-    ];
-  },
-});
-
 const blockInsertInDeleteExtension = Extension.create({
   name: 'blockInsertInDelete',
   addProseMirrorPlugins() {
@@ -1734,16 +1663,42 @@ const editor = useEditor({
     proposedHighlightExtension,
     proposedDeletionExtension,
     blockInsertInDeleteExtension,
-    textHistoryExtension,
   ],
   editable: !isCommentOnly.value,
   onCreate: ({ editor: ed }) => {
     // eslint-disable-next-line no-console
     console.log('[tiptap] editor created', ed.state.doc.toJSON());
+
+    // 1. Подтянуть актуальные данные из Y.Map (на случай, если provider уже успел синхронизироваться)
+    updateHistoryFromYjs();
+    updateCommentsFromYjs();
+    updateProposedChangesFromYjs();
+
+    // 2. Насильно дернуть плагины подсветки, чтобы они пересчитали декорации
+    const trComments = ed.state.tr.setMeta(commentsPluginKey, {
+      type: 'comments-updated',
+    });
+    ed.view.dispatch(trComments);
+
+    const trProposed = ed.state.tr.setMeta(proposedPluginKey, {
+      type: 'proposals-updated',
+    });
+    ed.view.dispatch(trProposed);
   },
   onUpdate: handleEditorUpdate,
   onSelectionUpdate: handleSelectionUpdate,
 });
+
+const snapshots = useSnapshots({
+  ydoc,
+  getEditor: () => editor.value,
+});
+
+const snapshotEntries = ref<snapshotEntry[]>([]);
+
+function updateSnapshotsFromYjs(): void {
+  snapshotEntries.value = snapshots.readSnapshotsSorted();
+}
 
 const toggleOnlyComments = () => {
   isCommentOnly.value = !isCommentOnly.value;
@@ -1775,6 +1730,32 @@ onMounted(() => {
   provider.on('status', (event: { status: string }) => {
     // eslint-disable-next-line no-console
     console.log('[hocuspocus] status:', event.status);
+  });
+
+  provider.on('synced', (synced: boolean) => {
+    // eslint-disable-next-line no-console
+    console.log('[hocuspocus] synced:', synced);
+
+    if (!synced) return;
+
+    // перечитать все Y.Map-проекции из актуального состояния
+    updateHistoryFromYjs();
+    updateCommentsFromYjs();
+    updateProposedChangesFromYjs();
+
+    const ed = editor.value;
+    if (ed) {
+      // дернуть плагины подсветки, чтобы они перерассчитали декорации
+      const trComments = ed.state.tr.setMeta(commentsPluginKey, {
+        type: 'comments-updated',
+      });
+      ed.view.dispatch(trComments);
+
+      const trProposed = ed.state.tr.setMeta(proposedPluginKey, {
+        type: 'proposals-updated',
+      });
+      ed.view.dispatch(trProposed);
+    }
   });
 
   // Подписка на изменения списка пользователей
@@ -1829,6 +1810,33 @@ onMounted(() => {
   updateCommentsFromYjs();
   updateProposedChangesFromYjs();
 
+  // Первый снапшот при монтировании компонента
+  snapshots.createSnapshot('mounted');
+
+  // Периодический снапшот раз в 30 секунд
+  snapshotIntervalId = window.setInterval(() => {
+    snapshots.createSnapshot('interval');
+  }, 30_000);
+
+  visibilityChangeHandler = () => {
+    if (document.visibilityState === 'hidden') {
+      snapshots.createSnapshot('visibility-hidden');
+    }
+  };
+
+  document.addEventListener('visibilitychange', visibilityChangeHandler);
+
+  // Если нужно сразу иметь список снапшотов в UI
+  updateSnapshotsFromYjs();
+
+  // Можно также подписаться на Y.Map снапшотов (аналогично истории)
+  const snapshotsMap: Y.Map<snapshotEntry> =
+    ydoc.getMap<snapshotEntry>('snapshots');
+
+  snapshotsMap.observe(() => {
+    updateSnapshotsFromYjs();
+  });
+
   // eslint-disable-next-line no-console
   console.log('[editor] instance', editor.value);
 });
@@ -1849,8 +1857,21 @@ onBeforeUnmount(() => {
     historyMap.unobserve(historyObserver);
   }
 
+  // Финальный снапшот перед размонтированием
+  snapshots.createSnapshot('unmounted');
+
+  if (snapshotIntervalId !== null) {
+    window.clearInterval(snapshotIntervalId);
+    snapshotIntervalId = null;
+  }
+
+  if (visibilityChangeHandler) {
+    document.removeEventListener('visibilitychange', visibilityChangeHandler);
+    visibilityChangeHandler = null;
+  }
+
   editor.value?.destroy();
-  provider.destroy();
+  // provider.destroy();
 });
 // --------------------
 // Вспомогательная функция для доступа к YSyncState из редактора
@@ -2066,9 +2087,6 @@ const clearHistory = (): void => {
   ydoc.transact(() => {
     historyMap.clear();
   });
-
-  // сбросить группировку по тексту, чтобы новые вставки/удаления шли как новые записи
-  history.resetTextHistoryGrouping();
   historyEntries.value = [];
 };
 
