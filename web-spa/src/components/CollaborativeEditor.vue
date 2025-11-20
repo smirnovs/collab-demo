@@ -292,47 +292,23 @@ import { useEditor, EditorContent } from '@tiptap/vue-3';
 import StarterKit from '@tiptap/starter-kit';
 import Collaboration from '@tiptap/extension-collaboration';
 import CollaborationCaret from '@tiptap/extension-collaboration-caret';
-import {
-  ySyncPluginKey,
-  absolutePositionToRelativePosition,
-} from '@tiptap/y-tiptap';
-import type { Node as ProsemirrorNode } from '@tiptap/pm/model';
-import type { Transaction } from '@tiptap/pm/state';
-import type { Editor as TiptapEditor } from '@tiptap/core';
-import { Extension } from '@tiptap/core';
 import { useSnapshots } from '../composables/useSnapshots';
 import { useHistory } from '../composables/useHistory';
 import { getCollabDoc } from '../shared/collabClient';
 import {
   createRandomUser,
-  createCollabId,
-  relativePositionToBase64,
-  getDocTextRange,
-  resolveAnchorRange,
-  getYSyncStateFromEditor,
   refreshHighlights,
 } from '../composables/useCollabHelpers';
 
 import { useComments, commentsPluginKey } from '../composables/useComments';
 import { useProposals, proposedPluginKey } from '../composables/useProposals';
-import type { commentAnchor } from '../composables/useComments';
+import { useEditorUpdate } from '../composables/useEditorUpdate';
+import { useDeletionProposal } from '../composables/useDeletionProposal';
 import type { historyEntry } from '../types/historyTypes';
 import type { snapshotEntry } from '../types/snapshotTypes';
 // --------------------
 // Типы
 // --------------------
-
-type proposedChangeStatus = 'pending' | 'approved';
-type proposedChangeKind = 'insert' | 'delete';
-
-interface proposedChangeData {
-  id: string;
-  authorName: string;
-  status: proposedChangeStatus;
-  kind: proposedChangeKind;
-  text: string;
-  anchor: commentAnchor;
-}
 
 interface collabUser {
   name: string;
@@ -409,6 +385,31 @@ const {
   hideSelectionPopup,
 });
 
+// ======================
+// onUpdate редактора (insert-proposals)
+// ======================
+const { handleEditorUpdate } = useEditorUpdate({
+  ydoc,
+  currentUser,
+  history,
+  proposedChangesMap,
+  activeProposalId,
+  editorMode,
+  proposedPluginKey,
+  getEditor: () => editor.value,
+});
+
+// --- предложения: удаление ---
+const { proposedDeletionExtension } = useDeletionProposal({
+  ydoc,
+  history,
+  proposedChangesMap,
+  activeProposalId,
+  editorMode,
+  proposedPluginKey,
+  getEditor: () => editor.value,
+});
+
 // История изменений
 const historyMap: Y.Map<historyEntry> = ydoc.getMap<historyEntry>('history');
 
@@ -469,539 +470,6 @@ function updateOnlineUsersFromStates(
 
   onlineUsers.value = result;
 }
-
-function handleEditorUpdate(params: {
-  editor: TiptapEditor;
-  transaction: Transaction;
-}): void {
-  const tr = params.transaction;
-
-  // Транзакции, пришедшие из Yjs (другие клиенты / undo / history),
-  // игнорируются — предложения создаём только из локального ввода.
-  const isYChangeOrigin = !!tr.getMeta(ySyncPluginKey);
-  if (isYChangeOrigin) {
-    return;
-  }
-
-  if (editorMode.value !== 'propose') {
-    return;
-  }
-
-  if (!tr.docChanged) {
-    return;
-  }
-
-  const yState = getYSyncStateFromEditor(editor.value);
-  if (!yState) {
-    return;
-  }
-
-  const ed = params.editor;
-  const doc = ed.state.doc as ProsemirrorNode;
-
-  // Находим диапазон вставленного текста по шагам транзакции
-  let insertionFrom: number | null = null;
-  let insertionTo: number | null = null;
-  let hasReplaceLikeStep = false;
-
-  tr.steps.forEach((step) => {
-    const s = step as unknown as {
-      from?: number;
-      to?: number;
-      slice?: { size: number };
-    };
-
-    if (!s.slice || typeof s.slice.size !== 'number' || s.slice.size === 0) {
-      return;
-    }
-
-    if (typeof s.from !== 'number' || typeof s.to !== 'number') {
-      return;
-    }
-
-    // Если есть шаг вида "замена" (from !== to), трактуем всю транзакцию как replace
-    // и НЕ создаём proposal для вставки.
-    if (s.from !== s.to) {
-      hasReplaceLikeStep = true;
-      return;
-    }
-
-    // Чистая вставка
-    const mappedFrom = tr.mapping.map(s.from, -1);
-    const start = mappedFrom;
-    const end = mappedFrom + s.slice.size;
-
-    if (insertionFrom === null || start < insertionFrom) {
-      insertionFrom = start;
-    }
-    if (insertionTo === null || end > insertionTo) {
-      insertionTo = end;
-    }
-  });
-
-  // Ввод по выделенному тексту / сложная замена — пропускается
-  if (hasReplaceLikeStep) {
-    return;
-  }
-
-  if (
-    insertionFrom === null ||
-    insertionTo === null ||
-    insertionFrom === insertionTo
-  ) {
-    return;
-  }
-
-  const startNew = insertionFrom;
-  const endNew = insertionTo;
-
-  // Привязка к Yjs через RelativePosition
-  const startRelNew = absolutePositionToRelativePosition(
-    startNew,
-    yState.type,
-    yState.binding.mapping
-  );
-  const endRelNew = absolutePositionToRelativePosition(
-    endNew,
-    yState.type,
-    yState.binding.mapping
-  );
-
-  if (!startRelNew || !endRelNew) {
-    // eslint-disable-next-line no-console
-    console.warn('[proposed] failed to create relative positions for insert');
-    return;
-  }
-
-  const newTextFull = getDocTextRange(doc, startNew, endNew);
-
-  ydoc.transact(() => {
-    let reusedExisting = false;
-    const currentId = activeProposalId.value;
-
-    // Попытка расширить текущий активный proposal, если вставка
-    // пересекается или соседствует с его диапазоном
-    if (currentId) {
-      const existing = proposedChangesMap.get(currentId);
-      if (
-        existing &&
-        existing.status === 'pending' &&
-        existing.kind === 'insert'
-      ) {
-        try {
-          const existingRange = resolveAnchorRange(existing.anchor, yState);
-          if (existingRange) {
-            const areAdjacentOrOverlap =
-              endNew >= existingRange.from - 1 &&
-              startNew <= existingRange.to + 1;
-
-            if (areAdjacentOrOverlap) {
-              const mergedFrom = Math.min(existingRange.from, startNew);
-              const mergedTo = Math.max(existingRange.to, endNew);
-
-              const mergedStartRel = absolutePositionToRelativePosition(
-                mergedFrom,
-                yState.type,
-                yState.binding.mapping
-              );
-              const mergedEndRel = absolutePositionToRelativePosition(
-                mergedTo,
-                yState.type,
-                yState.binding.mapping
-              );
-
-              if (mergedStartRel && mergedEndRel) {
-                const newAnchor: commentAnchor = {
-                  start: relativePositionToBase64(mergedStartRel),
-                  end: relativePositionToBase64(mergedEndRel),
-                };
-
-                const mergedText = getDocTextRange(doc, mergedFrom, mergedTo);
-
-                const updated = {
-                  ...existing,
-                  anchor: newAnchor,
-                  text: mergedText,
-                };
-
-                proposedChangesMap.set(currentId, updated);
-                history.updateProposalInsertText(currentId, mergedText);
-
-                reusedExisting = true;
-              }
-            }
-          }
-        } catch (error) {
-          // eslint-disable-next-line no-console
-          console.warn(
-            '[proposed] failed to extend proposal',
-            currentId,
-            error
-          );
-        }
-      }
-    }
-
-    // Если не получилось расширить существующее предложение — создаётся новое
-    if (!reusedExisting) {
-      const id = createCollabId();
-
-      const anchor: commentAnchor = {
-        start: relativePositionToBase64(startRelNew),
-        end: relativePositionToBase64(endRelNew),
-      };
-
-      const change: proposedChangeData = {
-        id,
-        authorName: currentUser.name,
-        status: 'pending',
-        kind: 'insert',
-        text: newTextFull,
-        anchor,
-      };
-
-      proposedChangesMap.set(id, change);
-      activeProposalId.value = id;
-      history.logProposalInsertCreated(id, newTextFull);
-    }
-  });
-
-  const edInstance = editor.value;
-  if (edInstance) {
-    const metaTr = edInstance.state.tr.setMeta(proposedPluginKey, {
-      type: 'proposals-updated',
-    });
-    edInstance.view.dispatch(metaTr);
-  }
-}
-
-function handleCutKey(ed: TiptapEditor): boolean {
-  if (editorMode.value !== 'propose') {
-    return false;
-  }
-
-  const { state } = ed;
-  const { from, to, empty } = state.selection;
-
-  // Нет выделения — режиссировать нечего, даём типтапу жить своей жизнью
-  if (empty) {
-    return false;
-  }
-
-  const created = createDeletionProposal(from, to, ed);
-  if (!created) return false;
-
-  // Оставляем выделение на помеченном диапазоне
-  ed.chain().setTextSelection({ from, to }).run();
-
-  // true: блокируем реальный cut (текст остаётся в документе, только подсветка)
-  return true;
-}
-
-function handleDeleteKey(
-  ed: TiptapEditor,
-  direction: 'backward' | 'forward'
-): boolean {
-  if (editorMode.value !== 'propose') {
-    return false;
-  }
-
-  const { state } = ed;
-  const { from, to, empty } = state.selection;
-
-  // Удаление внутри pending insert-proposal:
-  // - реально удаляет текст;
-  // - обновляет текст proposal;
-  // - не создаёт delete-proposal.
-  function deleteInsideInsertProposal(delFrom: number, delTo: number): boolean {
-    if (delFrom >= delTo) return false;
-
-    const yStateBefore = getYSyncStateFromEditor(ed);
-    if (!yStateBefore) return false;
-
-    let targetId: string | null = null;
-    let targetChange: proposedChangeData | undefined;
-
-    // Ищем pending insert, внутри которого полностью лежит диапазон удаления
-    proposedChangesMap.forEach((change, id) => {
-      if (targetId) return;
-      if (change.status !== 'pending' || change.kind !== 'insert') return;
-
-      const range = resolveAnchorRange(change.anchor, yStateBefore);
-      if (!range) return;
-
-      if (delFrom >= range.from && delTo <= range.to) {
-        targetId = id;
-        targetChange = change;
-      }
-    });
-
-    if (!targetId || !targetChange) {
-      return false;
-    }
-
-    // 1) Реально удаляем текст из документа
-    ed.chain().deleteRange({ from: delFrom, to: delTo }).run();
-
-    const yStateAfter = getYSyncStateFromEditor(ed);
-    if (!yStateAfter) {
-      return true; // текст уже удалён, proposal хотя бы не сломается
-    }
-
-    const newRange = resolveAnchorRange(targetChange.anchor, yStateAfter);
-    if (!newRange) {
-      return true;
-    }
-
-    const newDoc = ed.state.doc as ProsemirrorNode;
-    const newText = getDocTextRange(newDoc, newRange.from, newRange.to);
-
-    const updated: proposedChangeData = {
-      ...targetChange,
-      text: newText,
-    };
-
-    ydoc.transact(() => {
-      proposedChangesMap.set(targetId as string, updated);
-      history.updateProposalInsertText(targetId as string, newText);
-    });
-
-    return true;
-  }
-
-  // 1) Есть выделение
-  if (!empty) {
-    // Если удаляемый диапазон целиком внутри вставки — просто удаляем и обновляем insert-proposal
-    if (deleteInsideInsertProposal(from, to)) {
-      // Можно оставить курсор на начале диапазона (поведение Backspace/Delete с выделением)
-      ed.chain().setTextSelection(from).run();
-      return true;
-    }
-
-    // Иначе — обычное поведение: создаём delete-proposal по выделению
-    const created = createDeletionProposal(from, to, ed);
-    if (!created) return false;
-
-    ed.chain().setTextSelection({ from, to }).run();
-    return true;
-  }
-
-  // 2) Нет выделения — работаем по одной букве
-  const docSize = state.doc.content.size;
-  let start: number;
-  let end: number;
-
-  if (direction === 'backward') {
-    if (from <= 1) {
-      return false;
-    }
-    start = from - 1;
-    end = from;
-  } else {
-    if (from >= docSize) {
-      return false;
-    }
-    start = from;
-    end = from + 1;
-  }
-
-  // Если удаляемая буква лежит целиком внутри вставки — удаляем её и сужаем insert-proposal
-  if (deleteInsideInsertProposal(start, end)) {
-    const collapsePos = direction === 'backward' ? start : end;
-    ed.chain().setTextSelection(collapsePos).run();
-    return true;
-  }
-
-  // Вне вставки — создаём delete-proposal, как и раньше
-  const created = createDeletionProposal(start, end, ed);
-  if (!created) return false;
-
-  const collapsePos = direction === 'backward' ? start : end;
-
-  ed.chain().setTextSelection(collapsePos).run();
-
-  return true;
-}
-
-function createDeletionProposal(
-  from: number,
-  to: number,
-  ed: TiptapEditor
-): boolean {
-  if (from >= to) return false;
-
-  const yState = getYSyncStateFromEditor(editor.value);
-  if (!yState) {
-    // eslint-disable-next-line no-console
-    console.warn('[proposed-delete] ySync state is not available');
-    return false;
-  }
-
-  const doc = ed.state.doc as ProsemirrorNode;
-
-  const startAbs = from;
-  const endAbs = to;
-
-  ydoc.transact(() => {
-    let merged = false;
-    const currentId = activeProposalId.value;
-
-    if (currentId) {
-      const existing = proposedChangesMap.get(currentId);
-      if (
-        existing &&
-        existing.status === 'pending' &&
-        existing.kind === 'delete'
-      ) {
-        try {
-          const existingRange = resolveAnchorRange(existing.anchor, yState);
-          if (existingRange) {
-            const newStart = Math.min(existingRange.from, startAbs);
-            const newEnd = Math.max(existingRange.to, endAbs);
-
-            // Мержим только если диапазоны пересекаются или соседствуют
-            const areAdjacentOrOverlap =
-              endAbs >= existingRange.from - 1 &&
-              startAbs <= existingRange.to + 1;
-
-            if (areAdjacentOrOverlap) {
-              const newStartRel = absolutePositionToRelativePosition(
-                newStart,
-                yState.type,
-                yState.binding.mapping
-              );
-              const newEndRel = absolutePositionToRelativePosition(
-                newEnd,
-                yState.type,
-                yState.binding.mapping
-              );
-
-              if (newStartRel && newEndRel) {
-                const newAnchor: commentAnchor = {
-                  start: relativePositionToBase64(newStartRel),
-                  end: relativePositionToBase64(newEndRel),
-                };
-
-                const newText = getDocTextRange(doc, newStart, newEnd);
-
-                const updated: proposedChangeData = {
-                  ...existing,
-                  anchor: newAnchor,
-                  text: newText,
-                };
-
-                proposedChangesMap.set(currentId, updated);
-                history.updateProposalDeleteText(currentId, newText);
-                // если нужно, можно отдельно добавить history.updateProposalDeleteText(...)
-                // но для TextDeleted группировка уже реализована через logTextDeleted выше
-
-                merged = true;
-              }
-            }
-          }
-        } catch (error) {
-          // eslint-disable-next-line no-console
-          console.warn(
-            '[proposed-delete] failed to merge deletion proposal',
-            currentId,
-            error
-          );
-        }
-      }
-    }
-
-    if (!merged) {
-      const startRel = absolutePositionToRelativePosition(
-        startAbs,
-        yState.type,
-        yState.binding.mapping
-      );
-      const endRel = absolutePositionToRelativePosition(
-        endAbs,
-        yState.type,
-        yState.binding.mapping
-      );
-
-      if (!startRel || !endRel) {
-        // eslint-disable-next-line no-console
-        console.warn(
-          '[proposed-delete] failed to create relative positions for range'
-        );
-        return;
-      }
-
-      const anchor: commentAnchor = {
-        start: relativePositionToBase64(startRel),
-        end: relativePositionToBase64(endRel),
-      };
-
-      const text = getDocTextRange(doc, startAbs, endAbs);
-
-      const id = createCollabId();
-
-      const change: proposedChangeData = {
-        id,
-        authorName: currentUser.name,
-        status: 'pending',
-        kind: 'delete',
-        text,
-        anchor,
-      };
-
-      proposedChangesMap.set(id, change);
-      activeProposalId.value = id;
-      history.logProposalDeleteCreated(id, text);
-    }
-  });
-
-  const tr = ed.state.tr.setMeta(proposedPluginKey, {
-    type: 'proposals-updated',
-  });
-  ed.view.dispatch(tr);
-
-  return true;
-}
-
-const proposedDeletionExtension = Extension.create({
-  name: 'proposedDeletion',
-  addKeyboardShortcuts() {
-    return {
-      Backspace: () => handleDeleteKey(this.editor, 'backward'),
-      Delete: () => handleDeleteKey(this.editor, 'forward'),
-      'Mod-x': () => handleCutKey(this.editor),
-      Enter: () => {
-        if (editorMode.value !== 'propose') {
-          return false;
-        }
-
-        const { empty } = this.editor.state.selection;
-
-        // Если есть выделение — блокируем Enter, чтобы не было замены текста
-        if (!empty) {
-          return true;
-        }
-
-        // Без выделения пусть Enter работает как обычно
-        return false;
-      },
-      'Mod-v': () => {
-        if (editorMode.value !== 'propose') {
-          return false;
-        }
-
-        const { empty } = this.editor.state.selection;
-
-        // Если есть выделение — блокируем Ctrl+V, чтобы не было замены текста
-        if (!empty) {
-          return true;
-        }
-
-        // Без выделения вставка разрешена
-        return false;
-      },
-    };
-  },
-});
 
 // --------------------
 // Tiptap Editor + Collaboration + CollaborationCaret
