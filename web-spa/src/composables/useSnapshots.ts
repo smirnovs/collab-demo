@@ -8,18 +8,27 @@ interface snapshotsInitOptions {
   getEditor: () => TiptapEditor | undefined;
 }
 
-interface groupState {
-  groupId: string;
-  startedAt: string; // ISO
+function areDocsEqual(
+  a: JSONContent | null | undefined,
+  b: JSONContent | null | undefined
+): boolean {
+  if (!a && !b) return true;
+  if (!a || !b) return false;
+  return JSON.stringify(a) === JSON.stringify(b);
 }
 
-const SNAPSHOT_GROUP_MAX_AGE_MS = 60 * 60 * 1000; // 1 час
+function getLastSnapshot(
+  snapshotsMap: Y.Map<snapshotEntry>
+): snapshotEntry | null {
+  let last: snapshotEntry | null = null;
 
-function createId(): string {
-  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
-    return crypto.randomUUID();
-  }
-  return String(Date.now()) + '-' + String(Math.random()).slice(2);
+  snapshotsMap.forEach((value) => {
+    if (!last || value.createdAt > last.createdAt) {
+      last = value;
+    }
+  });
+
+  return last;
 }
 
 export function useSnapshots(options: snapshotsInitOptions) {
@@ -28,48 +37,47 @@ export function useSnapshots(options: snapshotsInitOptions) {
   const snapshotsMap: Y.Map<snapshotEntry> =
     ydoc.getMap<snapshotEntry>('snapshots');
 
-  // Локальное состояние текущей группы (хранится только в памяти вкладки)
-  let currentGroup: groupState = {
-    groupId: createId(),
-    startedAt: new Date().toISOString(),
-  };
-
-  function ensureGroupFresh(): void {
-    const now = Date.now();
-    const started = Date.parse(currentGroup.startedAt);
-
-    if (Number.isNaN(started) || now - started > SNAPSHOT_GROUP_MAX_AGE_MS) {
-      currentGroup = {
-        groupId: createId(),
-        startedAt: new Date().toISOString(),
-      };
-    }
-  }
-
-  function startNewGrouping(): void {
-    currentGroup = {
-      groupId: createId(),
-      startedAt: new Date().toISOString(),
-    };
+  function getCurrentGroupId(): string {
+    const now = new Date();
+    // YYYY-MM-DDTHH
+    return now.toISOString().slice(0, 13);
   }
 
   function createSnapshot(reason: snapshotEntry['reason']): void {
-    const editor = getEditor();
-    if (!editor) return;
+    const ed = getEditor();
+    if (!ed) return;
 
-    ensureGroupFresh();
+    const docJson = ed.getJSON() as JSONContent;
 
-    const docJson: JSONContent = editor.getJSON();
+    // Последний снапшот
+    const last = getLastSnapshot(snapshotsMap);
+
+    // 1. Если документ не изменился — ничего не записываем
+    if (last && areDocsEqual(last.doc, docJson)) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+
+    // 2. Группировка по часу
+    const groupId = getCurrentGroupId();
+
+    // 3. Запись
+    const id =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : String(Date.now());
+
     const entry: snapshotEntry = {
-      id: createId(),
-      createdAt: new Date().toISOString(),
-      groupId: currentGroup.groupId,
+      id,
+      createdAt: now,
       reason,
+      groupId,
       doc: docJson,
     };
 
     ydoc.transact(() => {
-      snapshotsMap.set(entry.id, entry);
+      snapshotsMap.set(id, entry);
     });
   }
 
@@ -85,7 +93,6 @@ export function useSnapshots(options: snapshotsInitOptions) {
 
   return {
     createSnapshot,
-    startNewGrouping,
     readSnapshotsSorted,
   };
 }

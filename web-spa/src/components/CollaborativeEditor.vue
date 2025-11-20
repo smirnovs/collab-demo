@@ -78,7 +78,7 @@
           <div class="font-medium">Совместный редактор</div>
         </div>
 
-        <div ref="editorContentWrapper" class="p-4 min-h-[320px] relative">
+        <div ref="editorContentWrapper" class="p-4 min-h-80 relative">
           <EditorContent v-if="editor" :editor="editor" />
           <div v-else class="text-sm text-gray-500">
             Инициализация редактора…
@@ -118,45 +118,6 @@
             :style="{ backgroundColor: currentUser.color }"
           />
           <span>Текущий пользователь: {{ currentUser.name }}</span>
-        </div>
-      </div>
-      <div class="mt-6 border rounded-lg bg-white">
-        <div class="px-4 py-2 border-b flex items-center justify-between">
-          <div class="text-sm font-medium">История изменений</div>
-          <button
-            type="button"
-            class="text-xs px-2 py-1 border rounded hover:bg-gray-50"
-            @click="clearHistory"
-          >
-            Очистить историю
-          </button>
-        </div>
-
-        <div class="p-4 max-h-64 overflow-y-auto text-xs">
-          <div v-if="historyView.length === 0" class="text-gray-500">
-            Пока нет записей истории.
-          </div>
-
-          <ul v-else class="space-y-2">
-            <li
-              v-for="entry in historyView"
-              :key="entry.id"
-              class="border rounded px-2 py-1 bg-gray-50"
-            >
-              <div class="flex items-center justify-between mb-1">
-                <span class="font-semibold">
-                  {{ entry.kind }}
-                </span>
-                <span class="text-[10px] text-gray-500">
-                  {{ new Date(entry.createdAt).toLocaleTimeString() }}
-                </span>
-              </div>
-              <div class="text-gray-700">
-                <span class="font-medium">{{ entry.userName }}</span>
-                <span v-if="entry.text"> : {{ entry.text }} </span>
-              </div>
-            </li>
-          </ul>
         </div>
       </div>
     </div>
@@ -240,7 +201,7 @@
               {{ p.authorName }}
             </div>
             <div
-              class="overflow-hidden line-clamp-3 break-words whitespace-normal"
+              class="overflow-hidden line-clamp-3 wrap-break-word whitespace-normal"
             >
               {{ p.text }}
             </div>
@@ -281,6 +242,45 @@
           </div>
         </div>
       </div>
+      <div class="mt-6 border rounded-lg bg-white">
+        <div class="px-4 py-2 border-b flex items-center justify-between">
+          <div class="text-sm font-medium">История изменений</div>
+          <button
+            type="button"
+            class="text-xs px-2 py-1 border rounded hover:bg-gray-50"
+            @click="clearHistory"
+          >
+            Очистить историю
+          </button>
+        </div>
+
+        <div class="p-4 max-h-64 overflow-y-auto text-xs">
+          <div v-if="historyView.length === 0" class="text-gray-500">
+            Пока нет записей истории.
+          </div>
+
+          <ul v-else class="space-y-2">
+            <li
+              v-for="entry in historyView"
+              :key="entry.id"
+              class="border rounded px-2 py-1 bg-gray-50"
+            >
+              <div class="flex items-center justify-between mb-1">
+                <span class="font-semibold">
+                  {{ entry.kind }}
+                </span>
+                <span class="text-[10px] text-gray-500">
+                  {{ new Date(entry.createdAt).toLocaleTimeString() }}
+                </span>
+              </div>
+              <div class="text-gray-700">
+                <span class="font-medium">{{ entry.userName }}</span>
+                <span v-if="entry.text"> : {{ entry.text }} </span>
+              </div>
+            </li>
+          </ul>
+        </div>
+      </div>
     </aside>
   </div>
 </template>
@@ -296,7 +296,6 @@ import * as Y from 'yjs';
 import {
   ySyncPluginKey,
   absolutePositionToRelativePosition,
-  relativePositionToAbsolutePosition,
 } from '@tiptap/y-tiptap';
 import type { Node as ProsemirrorNode } from '@tiptap/pm/model';
 import {
@@ -313,6 +312,17 @@ import { useHistory } from '../composables/useHistory';
 import type { historyEntry } from '../types/historyTypes';
 import { useSnapshots } from '../composables/useSnapshots';
 import type { snapshotEntry } from '../types/snapshotTypes';
+import {
+  createRandomUser,
+  createCollabId,
+  relativePositionToBase64,
+  getDocTextRange,
+  resolveAnchorRange,
+  getYSyncStateFromEditor,
+} from '../composables/useCollabHelpers';
+
+import { useComments, commentsPluginKey } from '../composables/useComments';
+import type { commentAnchor } from '../composables/useComments';
 
 // --------------------
 // Типы
@@ -322,26 +332,6 @@ type ProsemirrorMapping = Map<
   Y.AbstractType<unknown>,
   ProsemirrorNode | ProsemirrorNode[]
 >;
-
-interface CommentsPluginOptions {
-  getComments: () => commentData[];
-  getActiveCommentId: () => string | null;
-  onCommentClick?: (id: string) => void;
-}
-
-interface commentAnchor {
-  // base64-сериализация Y.RelativePosition для начала и конца выделения
-  start: string;
-  end: string;
-}
-
-interface commentData {
-  id: string;
-  text: string;
-  authorName: string;
-  resolved: boolean;
-  anchor: commentAnchor;
-}
 
 type proposedChangeStatus = 'pending' | 'approved';
 type proposedChangeKind = 'insert' | 'delete';
@@ -377,6 +367,15 @@ interface YSyncState {
   binding: YSyncBinding;
 }
 
+interface textRangeBlocked {
+  from: number;
+  to: number;
+}
+
+function rangesIntersect(a: textRangeBlocked, b: textRangeBlocked): boolean {
+  return a.from < b.to && a.to > b.from;
+}
+
 // --------------------
 // Генерация пользователя (один случайный юзер на вкладку)
 // --------------------
@@ -385,34 +384,11 @@ let snapshotIntervalId: number | null = null;
 
 let visibilityChangeHandler: (() => void) | null = null;
 
-function createRandomColor(): string {
-  const hue = Math.floor(Math.random() * 360);
-  return `hsl(${hue} 80% 60%)`;
-}
-
-function createRandomUser(): collabUser {
-  const suffix = Math.floor(Math.random() * 9000) + 1000;
-  return {
-    name: `User ${suffix}`,
-    color: createRandomColor(),
-  };
-}
-
 const currentUser: collabUser = createRandomUser();
 
 // --------------------
 // Yjs + Hocuspocus
 // --------------------
-
-// const documentName = 'demo-document-1';
-// const hocuspocusUrl = 'ws://localhost:1234';
-
-// const provider = new HocuspocusProvider({
-//   url: hocuspocusUrl,
-//   name: documentName,
-// });
-
-// const ydoc = provider.document as Y.Doc;
 
 const { ydoc, provider } = getCollabDoc();
 
@@ -421,8 +397,30 @@ const history = useHistory({
   currentUser,
 });
 
+const {
+  comments,
+  activeCommentId,
+  commentsMap,
+  editorContentWrapper,
+  selectionPopup,
+  selectionCommentText,
+  commentsHighlightExtension,
+  updateCommentsFromYjs,
+  focusCommentById,
+  handleSelectionUpdate,
+  handleAddCommentFromPopup,
+  resolveComment,
+  removeComment,
+  hideSelectionPopup,
+} = useComments({
+  ydoc,
+  currentUser,
+  history,
+  getEditor: () => editor.value,
+});
+
 // Y.Map для комментариев — единый источник правды
-const commentsMap: Y.Map<commentData> = ydoc.getMap<commentData>('comments');
+// const commentsMap: Y.Map<commentData> = ydoc.getMap<commentData>('comments');
 
 const proposedChangesMap: Y.Map<proposedChangeData> =
   ydoc.getMap<proposedChangeData>('proposedChanges');
@@ -444,7 +442,6 @@ function updateHistoryFromYjs(): void {
   historyEntries.value = next;
 }
 
-// Упрощённая проекция для шаблона
 const historyView = computed(() =>
   historyEntries.value.map((entry) => ({
     id: entry.id,
@@ -463,29 +460,6 @@ const proposedChanges = ref<proposedChangeData[]>([]);
 const editorMode = ref<'edit' | 'propose'>('edit');
 const isCommentOnly = ref<boolean>(false);
 const activeProposalId = ref<string | null>(null);
-
-const editorContentWrapper = ref<HTMLElement | null>(null);
-
-const selectionPopup = ref<{
-  visible: boolean;
-  top: number;
-  left: number;
-}>({
-  visible: false,
-  top: 0,
-  left: 0,
-});
-
-const selectionCommentText = ref<string>('');
-
-function hideSelectionPopup(): void {
-  selectionPopup.value = {
-    visible: false,
-    top: 0,
-    left: 0,
-  };
-  selectionCommentText.value = '';
-}
 
 function updateProposedChangesFromYjs(): void {
   const next: proposedChangeData[] = [];
@@ -538,98 +512,8 @@ function updateOnlineUsersFromStates(
 }
 
 // --------------------
-// Vue-реактивный список комментариев — проекция Y.Map
-// --------------------
-
-const comments = ref<commentData[]>([]);
-const activeCommentId = ref<string | null>(null);
-
-function updateCommentsFromYjs(): void {
-  const next: commentData[] = [];
-  commentsMap.forEach((value) => {
-    next.push(value);
-  });
-  comments.value = next;
-}
-
-// --------------------
-// Вспомогательные функции для RelativePosition
-// --------------------
-
-function relativePositionToBase64(relPos: Y.RelativePosition): string {
-  const encoded = Y.encodeRelativePosition(relPos);
-  let binary = '';
-
-  for (const byte of encoded) {
-    binary += String.fromCharCode(byte);
-  }
-
-  return btoa(binary);
-}
-
-function base64ToRelativePosition(encoded: string): Y.RelativePosition {
-  const binary = atob(encoded);
-  const bytes = new Uint8Array(binary.length);
-
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-
-  return Y.decodeRelativePosition(bytes);
-}
-
-function getDocTextRange(
-  doc: ProsemirrorNode,
-  from: number,
-  to: number
-): string {
-  if (from >= to) return '';
-  try {
-    return doc.textBetween(from, to, '\n');
-  } catch {
-    return '';
-  }
-}
-
-function resolveAnchorRange(
-  anchor: commentAnchor,
-  yState: YSyncState
-): { from: number; to: number } | null {
-  try {
-    const startRel = base64ToRelativePosition(anchor.start);
-    const endRel = base64ToRelativePosition(anchor.end);
-
-    const startAbs = relativePositionToAbsolutePosition(
-      yState.doc,
-      yState.type,
-      startRel,
-      yState.binding.mapping
-    );
-    const endAbs = relativePositionToAbsolutePosition(
-      yState.doc,
-      yState.type,
-      endRel,
-      yState.binding.mapping
-    );
-
-    if (startAbs === null || endAbs === null || startAbs === endAbs) {
-      return null;
-    }
-
-    return {
-      from: Math.min(startAbs, endAbs),
-      to: Math.max(startAbs, endAbs),
-    };
-  } catch {
-    return null;
-  }
-}
-
-// --------------------
 // ProseMirror Plugin для подсветки диапазонов комментариев
 // --------------------
-
-const commentsPluginKey = new PluginKey<DecorationSet>('comments-plugin');
 
 function focusProposalById(id: string): void {
   activeProposalId.value = id;
@@ -640,14 +524,14 @@ function focusProposalById(id: string): void {
   const proposal = proposedChanges.value.find((p) => p.id === id);
   if (!proposal) return;
 
-  const yState = getYSyncStateFromEditor();
+  const yState = getYSyncStateFromEditor(editor.value);
   if (!yState) return;
 
   try {
     const range = resolveAnchorRange(proposal.anchor, yState);
     if (!range) return;
 
-    const { from, to } = range;
+    const { from } = range;
     ed.view.focus();
 
     const domPos = ed.view.domAtPos(from);
@@ -674,161 +558,28 @@ function focusProposalById(id: string): void {
   }
 }
 
-function focusCommentById(id: string): void {
-  activeCommentId.value = id;
-
-  const ed = editor.value;
-  if (!ed) return;
-
-  const comment = comments.value.find((c) => c.id === id);
-  if (!comment) return;
-
-  const yState = getYSyncStateFromEditor();
-  if (!yState) return;
-
-  try {
-    const range = resolveAnchorRange(comment.anchor, yState);
-    if (!range) return;
-
-    const { from, to } = range;
-    // Фокус на редакторе, но БЕЗ изменения selection
-    ed.view.focus();
-
-    // Скроллим DOM-узел, соответствующий началу диапазона
-    const domPos = ed.view.domAtPos(from);
-    let target: HTMLElement | null = null;
-
-    if (domPos.node.nodeType === Node.TEXT_NODE) {
-      target = domPos.node.parentElement;
-    } else if (domPos.node instanceof HTMLElement) {
-      target = domPos.node;
-    }
-
-    if (target) {
-      target.scrollIntoView({ block: 'center' });
-    }
-
-    // Триггер пересчёта декораций для подсветки активного комментария
-    const tr = ed.state.tr.setMeta(commentsPluginKey, {
-      type: 'active-comment-changed',
-      id,
-    });
-    ed.view.dispatch(tr);
-  } catch (error) {
-    // eslint-disable-next-line no-console
-    console.warn('[comments] failed to focus comment', id, error);
-  }
-}
-
-function createDecorations(params: {
-  state: EditorState;
-  comments: commentData[];
-  activeCommentId: string | null;
-}): DecorationSet {
-  const { state, comments, activeCommentId } = params;
-
-  const raw = ySyncPluginKey.getState(state) as
-    | (YSyncState & { binding: YSyncBinding | null })
-    | null
-    | undefined;
-
-  if (!raw || !raw.doc || !raw.type || !raw.binding || !raw.binding.mapping) {
-    return DecorationSet.empty;
-  }
-
-  const yState = raw as YSyncState;
-
-  const decorations: Decoration[] = [];
-
-  for (const comment of comments) {
-    if (comment.resolved) continue;
-
-    try {
-      const range = resolveAnchorRange(comment.anchor, yState);
-      if (!range) {
-        continue;
-      }
-
-      const { from, to } = range;
-      const isActive = comment.id === activeCommentId;
-      const classNames = ['tiptap-comment-mark'];
-
-      if (isActive) {
-        classNames.push('tiptap-comment-mark-selected');
-      }
-
-      decorations.push(
-        Decoration.inline(
-          from,
-          to,
-          {
-            class: classNames.join(' '),
-            'data-comment-id': comment.id,
-          },
-          { commentId: comment.id }
-        )
-      );
-    } catch {
-      // игнорируем битые анкеры
-    }
-  }
-
-  if (decorations.length === 0) {
-    return DecorationSet.empty;
-  }
-
-  return DecorationSet.create(state.doc, decorations);
-}
-
-function handleSelectionUpdate(params: { editor: TiptapEditor }): void {
-  const ed = params.editor;
-  const { from, to, empty } = ed.state.selection;
-
-  if (empty) {
-    hideSelectionPopup();
-    return;
-  }
-
-  const wrapper = editorContentWrapper.value;
-  if (!wrapper) {
-    hideSelectionPopup();
-    return;
-  }
-
-  try {
-    const startCoords = ed.view.coordsAtPos(from);
-    const endCoords = ed.view.coordsAtPos(to);
-
-    const middleLeft = (startCoords.left + endCoords.left) / 2;
-    const topBase = Math.min(startCoords.top, endCoords.top);
-
-    const wrapperRect = wrapper.getBoundingClientRect();
-
-    selectionPopup.value = {
-      visible: true,
-      top: topBase - wrapperRect.top,
-      left: middleLeft - wrapperRect.left,
-    };
-  } catch {
-    hideSelectionPopup();
-  }
-}
-
 function handleEditorUpdate(params: {
   editor: TiptapEditor;
   transaction: Transaction;
 }): void {
-  if (editorMode.value !== 'propose') {
+  const tr = params.transaction;
+
+  // Транзакции, пришедшие из Yjs (другие клиенты / undo / history),
+  // игнорируются — предложения создаём только из локального ввода.
+  const isYChangeOrigin = !!tr.getMeta(ySyncPluginKey);
+  if (isYChangeOrigin) {
     return;
   }
 
-  const tr = params.transaction;
+  if (editorMode.value !== 'propose') {
+    return;
+  }
 
   if (!tr.docChanged) {
     return;
   }
 
-  const yState = getYSyncStateFromEditor();
+  const yState = getYSyncStateFromEditor(editor.value);
   if (!yState) {
     return;
   }
@@ -932,7 +683,7 @@ function handleEditorUpdate(params: {
             startNew <= existingRange.to
           ) {
             const newAnchor: commentAnchor = {
-              // старт оставляем как есть, чтобы не дёргать якорь:
+              // старт оставляем как есть, чтобы не дёргать якорь
               start: existing.anchor.start,
               end: relativePositionToBase64(
                 absolutePositionToRelativePosition(
@@ -969,10 +720,7 @@ function handleEditorUpdate(params: {
 
     // Если не получилось расширить существующее предложение — создаётся новое
     if (!reusedExisting) {
-      const id =
-        typeof crypto !== 'undefined' && 'randomUUID' in crypto
-          ? crypto.randomUUID()
-          : String(Date.now());
+      const id = createCollabId();
 
       const anchor: commentAnchor = {
         start: relativePositionToBase64(startRelNew),
@@ -1087,7 +835,7 @@ function createDeletionProposal(
 ): boolean {
   if (from >= to) return false;
 
-  const yState = getYSyncStateFromEditor();
+  const yState = getYSyncStateFromEditor(editor.value);
   if (!yState) {
     // eslint-disable-next-line no-console
     console.warn('[proposed-delete] ySync state is not available');
@@ -1194,10 +942,7 @@ function createDeletionProposal(
 
       const text = getDocTextRange(doc, startAbs, endAbs);
 
-      const id =
-        typeof crypto !== 'undefined' && 'randomUUID' in crypto
-          ? crypto.randomUUID()
-          : String(Date.now());
+      const id = createCollabId();
 
       const change: proposedChangeData = {
         id,
@@ -1221,108 +966,6 @@ function createDeletionProposal(
 
   return true;
 }
-
-function createCommentsPlugin(
-  options: CommentsPluginOptions
-): Plugin<DecorationSet> {
-  return new Plugin<DecorationSet>({
-    key: commentsPluginKey,
-    state: {
-      init(_, state) {
-        return createDecorations({
-          state,
-          comments: options.getComments(),
-          activeCommentId: options.getActiveCommentId(),
-        });
-      },
-      apply(
-        tr: Transaction,
-        oldDecorationSet: DecorationSet,
-        _oldState: EditorState,
-        newState: EditorState
-      ) {
-        const meta = tr.getMeta(commentsPluginKey);
-
-        // ничего не поменялось — возвращаем старое
-        if (!tr.docChanged && !meta) {
-          return oldDecorationSet;
-        }
-
-        // если документ изменился, но МЕТА нет — это обычный набор текста/удаление
-        // даём ProseMirror сам смэпить декорации
-        if (tr.docChanged && !meta) {
-          return oldDecorationSet.map(tr.mapping, newState.doc);
-        }
-
-        // во всех случаях, когда есть meta (обновление списка/активация и т.п.),
-        // пересоздаём декорации из актуального списка comments + Y-анкеров
-        return createDecorations({
-          state: newState,
-          comments: options.getComments(),
-          activeCommentId: options.getActiveCommentId(),
-        });
-      },
-    },
-    props: {
-      decorations(state) {
-        return commentsPluginKey.getState(state) ?? null;
-      },
-      handleClick(view: EditorView, pos: number, event: MouseEvent): boolean {
-        const decoSet = commentsPluginKey.getState(view.state);
-        if (!decoSet) return false;
-
-        const found = decoSet.find(pos, pos);
-        if (found.length === 0) return false;
-
-        const deco = found[0];
-        if (!deco) return false;
-
-        const spec = deco.spec as { commentId?: string } | undefined;
-        const commentId = spec?.commentId;
-
-        if (!commentId || typeof commentId !== 'string') {
-          return false;
-        }
-
-        if (options.onCommentClick) {
-          options.onCommentClick(commentId);
-        }
-
-        const card = document.querySelector<HTMLElement>(
-          `[data-comment-card-id="${commentId}"]`
-        );
-        if (card) {
-          card.scrollIntoView({ block: 'nearest' });
-        }
-
-        const tr = view.state.tr.setMeta(commentsPluginKey, {
-          type: 'active-comment-changed',
-          id: commentId,
-        });
-        view.dispatch(tr);
-
-        return true;
-      },
-    },
-  });
-}
-
-// Tiptap Extension-обёртка над ProseMirror Plugin
-const commentsHighlightExtension = Extension.create({
-  name: 'commentsHighlight',
-  addProseMirrorPlugins() {
-    return [
-      createCommentsPlugin({
-        getComments: () => comments.value,
-        getActiveCommentId: () => activeCommentId.value,
-        onCommentClick: (id: string) => {
-          // Обновление активного комментария при клике по подсветке
-          activeCommentId.value = id;
-        },
-      }),
-    ];
-  },
-});
 
 const proposedPluginKey = new PluginKey<DecorationSet>('proposed-plugin');
 
@@ -1428,7 +1071,7 @@ function createProposedPlugin(): Plugin<DecorationSet> {
       decorations(state) {
         return proposedPluginKey.getState(state) ?? null;
       },
-      handleClick(view: EditorView, pos: number, event: MouseEvent): boolean {
+      handleClick(view: EditorView, pos: number): boolean {
         const decoSet = proposedPluginKey.getState(view.state);
         if (!decoSet) return false;
 
@@ -1482,43 +1125,67 @@ const blockInsertInDeleteExtension = Extension.create({
       new Plugin({
         key: new PluginKey('block-insert-in-delete'),
         filterTransaction(tr: Transaction, state: EditorState): boolean {
-          // Разрешаем всё, если:
-          // - не режим предложений
-          // - транзакция не меняет документ
-          if (editorMode.value !== 'propose') {
+          // 0) Ничего не делает документ — пропускаем
+          if (!tr.docChanged) {
             return true;
           }
 
-          if (!tr.docChanged) {
+          // 1) Транзакции, пришедшие из Yjs (другие клиенты / undo / history),
+          // не должны блокироваться этим плагином, иначе можно "ломать" синхронизацию.
+          const isYChangeOrigin = !!tr.getMeta(ySyncPluginKey);
+          if (isYChangeOrigin) {
             return true;
           }
 
           const selection = state.selection;
 
-          // Проверяем, есть ли в транзакции вставка текста вообще
+          // 2) Разбираем шаги транзакции: есть ли вставка / удаление и какие диапазоны меняются
           let hasInsertion = false;
+          const insertionSpans: textRangeBlocked[] = [];
+          const changeSpans: textRangeBlocked[] = [];
 
           tr.steps.forEach((step) => {
             const s = step as unknown as {
               from?: number;
+              to?: number;
               slice?: { size: number };
             };
 
-            if (!s.slice || typeof s.slice.size !== 'number') {
-              return;
+            const from = typeof s.from === 'number' ? (s.from as number) : null;
+            const to = typeof s.to === 'number' ? (s.to as number) : null;
+            const sliceSize =
+              s.slice && typeof s.slice.size === 'number'
+                ? (s.slice.size as number)
+                : 0;
+
+            // ВСТАВКА (в том числе часть replace-шага)
+            if (sliceSize > 0 && from !== null) {
+              hasInsertion = true;
+
+              const mappedFrom = tr.mapping.map(from, -1);
+              const insFrom = mappedFrom;
+              const insTo = mappedFrom + sliceSize;
+
+              const span: textRangeBlocked = { from: insFrom, to: insTo };
+              insertionSpans.push(span);
+              changeSpans.push(span);
             }
 
-            if (s.slice.size > 0) {
-              hasInsertion = true;
+            // УДАЛЕНИЕ / ЗАМЕНА (to > from)
+            if (from !== null && to !== null && to > from) {
+              const delFrom = tr.mapping.map(from, -1);
+              const delTo = tr.mapping.map(to, 1);
+
+              changeSpans.push({ from: delFrom, to: delTo });
             }
           });
 
-          // 1) Если есть выделение И есть вставка — блокируем печать/вставку.
-          // Это запрещает ввод текста поверх выделенного диапазона в режиме propose.
-          if (!selection.empty && hasInsertion) {
-            return false;
+          if (changeSpans.length === 0) {
+            // Ничего содержательного не меняем (например, только курсор) — пропускаем
+            return true;
           }
 
+          // 3) Получаем Y-состояние, чтобы распаковать якоря предложений в абсолютные координаты
           const raw = ySyncPluginKey.getState(state) as
             | (YSyncState & { binding: YSyncBinding | null })
             | null
@@ -1536,63 +1203,72 @@ const blockInsertInDeleteExtension = Extension.create({
 
           const yState = raw as YSyncState;
 
-          // 2) Собираем все pending delete-диапазоны в абсолютных координатах
-          const deleteRanges: { from: number; to: number }[] = [];
+          const pendingChanges = proposedChanges.value.filter(
+            (change) => change.status === 'pending'
+          );
 
-          for (const change of proposedChanges.value) {
-            if (change.status !== 'pending' || change.kind !== 'delete') {
-              continue;
-            }
-
-            const range = resolveAnchorRange(change.anchor, yState);
-            if (!range) {
-              continue;
-            }
-
-            deleteRanges.push(range);
-          }
-
-          if (deleteRanges.length === 0 || !hasInsertion) {
+          if (pendingChanges.length === 0) {
+            // Нет ни одного активного предложения — нечего блокировать
             return true;
           }
 
-          // 3) Проверяем шаги транзакции: если вставка пересекает delete-диапазон — блокируем
-          let blocked = false;
+          const allProposalRanges: textRangeBlocked[] = [];
+          const deleteRanges: textRangeBlocked[] = [];
 
-          tr.steps.forEach((step) => {
-            if (blocked) return;
+          for (const change of pendingChanges) {
+            const range = resolveAnchorRange(change.anchor, yState);
+            if (!range) continue;
 
-            const s = step as unknown as {
-              from?: number;
-              slice?: { size: number };
+            const normalized: textRangeBlocked = {
+              from: range.from,
+              to: range.to,
             };
 
-            if (
-              !s.slice ||
-              typeof s.slice.size !== 'number' ||
-              s.slice.size === 0
-            ) {
-              return;
+            allProposalRanges.push(normalized);
+
+            if (change.kind === 'delete') {
+              deleteRanges.push(normalized);
             }
+          }
 
-            if (typeof s.from !== 'number') {
-              return;
-            }
+          // 4) Логика для разных режимов редактора
 
-            const mappedFrom = tr.mapping.map(s.from, 1);
-            const insFrom = mappedFrom;
-            const insTo = mappedFrom + s.slice.size;
-
-            for (const r of deleteRanges) {
-              // Пересечение диапазонов вставки и delete-диапазона
-              if (insFrom < r.to && insTo > r.from) {
-                blocked = true;
-                break;
+          // --- Свободный режим: НЕЛЬЗЯ редактировать текст внутри любых предложений ---
+          if (editorMode.value === 'edit') {
+            for (const span of changeSpans) {
+              if (allProposalRanges.some((r) => rangesIntersect(span, r))) {
+                // Любая вставка/удаление, пересекающая диапазон предложения, запрещена
+                return false;
               }
             }
-          });
+            return true;
+          }
 
-          return !blocked;
+          // --- Режим предложений ---
+          if (editorMode.value === 'propose') {
+            // 4.1) Если есть выделение И есть вставка — блокируем печать/вставку.
+            // Это запрещает ввод текста поверх выделенного диапазона в режиме propose.
+            if (!selection.empty && hasInsertion) {
+              return false;
+            }
+
+            // 4.2) Если вставки нет или нет delete-диапазонов — дальше нечего блокировать.
+            if (!hasInsertion || deleteRanges.length === 0) {
+              return true;
+            }
+
+            // 4.3) Блокируем вставку, пересекающую диапазон "delete"-предложений.
+            for (const span of insertionSpans) {
+              if (deleteRanges.some((r) => rangesIntersect(span, r))) {
+                return false;
+              }
+            }
+
+            return true;
+          }
+
+          // На всякий случай — для неизвестных режимов ничего не блокируем
+          return true;
         },
       }),
     ];
@@ -1639,6 +1315,25 @@ const proposedDeletionExtension = Extension.create({
     };
   },
 });
+function refreshHighlights(): void {
+  const ed = editor.value;
+  if (!ed) return;
+
+  try {
+    const trComments = ed.state.tr.setMeta(commentsPluginKey, {
+      type: 'comments-updated',
+    });
+    ed.view.dispatch(trComments);
+
+    const trProposed = ed.state.tr.setMeta(proposedPluginKey, {
+      type: 'proposals-updated',
+    });
+    ed.view.dispatch(trProposed);
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.warn('[highlight] failed to refresh decorations', error);
+  }
+}
 
 // --------------------
 // Tiptap Editor + Collaboration + CollaborationCaret
@@ -1675,15 +1370,7 @@ const editor = useEditor({
     updateProposedChangesFromYjs();
 
     // 2. Насильно дернуть плагины подсветки, чтобы они пересчитали декорации
-    const trComments = ed.state.tr.setMeta(commentsPluginKey, {
-      type: 'comments-updated',
-    });
-    ed.view.dispatch(trComments);
-
-    const trProposed = ed.state.tr.setMeta(proposedPluginKey, {
-      type: 'proposals-updated',
-    });
-    ed.view.dispatch(trProposed);
+    refreshHighlights();
   },
   onUpdate: handleEditorUpdate,
   onSelectionUpdate: handleSelectionUpdate,
@@ -1705,7 +1392,7 @@ const toggleOnlyComments = () => {
   editor.value?.setEditable(!isCommentOnly.value);
 };
 
-const addText = ref<string>('');
+// const addText = ref<string>('');
 
 let awarenessChangeHandler:
   | ((payload: {
@@ -1743,19 +1430,7 @@ onMounted(() => {
     updateCommentsFromYjs();
     updateProposedChangesFromYjs();
 
-    const ed = editor.value;
-    if (ed) {
-      // дернуть плагины подсветки, чтобы они перерассчитали декорации
-      const trComments = ed.state.tr.setMeta(commentsPluginKey, {
-        type: 'comments-updated',
-      });
-      ed.view.dispatch(trComments);
-
-      const trProposed = ed.state.tr.setMeta(proposedPluginKey, {
-        type: 'proposals-updated',
-      });
-      ed.view.dispatch(trProposed);
-    }
+    refreshHighlights();
   });
 
   // Подписка на изменения списка пользователей
@@ -1821,6 +1496,10 @@ onMounted(() => {
   visibilityChangeHandler = () => {
     if (document.visibilityState === 'hidden') {
       snapshots.createSnapshot('visibility-hidden');
+    } else if (document.visibilityState === 'visible') {
+      // при возврате на вкладку заставляем плагины подсветки
+      // пересоздать декорации на основе актуальных Y-состояний
+      refreshHighlights();
     }
   };
 
@@ -1871,111 +1550,7 @@ onBeforeUnmount(() => {
   }
 
   editor.value?.destroy();
-  // provider.destroy();
 });
-// --------------------
-// Вспомогательная функция для доступа к YSyncState из редактора
-// --------------------
-
-function getYSyncStateFromEditor(): YSyncState | null {
-  const ed = editor.value;
-  if (!ed) return null;
-
-  const raw = ySyncPluginKey.getState(ed.state) as
-    | (YSyncState & { binding: YSyncBinding | null })
-    | null
-    | undefined;
-
-  if (!raw || !raw.doc || !raw.type || !raw.binding || !raw.binding.mapping) {
-    return null;
-  }
-
-  return raw as YSyncState;
-}
-
-// --------------------
-// Операции с комментариями — через Yjs-транзакции
-// --------------------
-
-const addCommentFromSelection = (): void => {
-  const ed = editor.value;
-  if (!ed) return;
-
-  const text = addText.value.trim();
-  if (!text) return;
-
-  const { from, to, empty } = ed.state.selection;
-
-  // На шаге F комментарий добавляется только к непустому выделению
-  if (empty) {
-    // eslint-disable-next-line no-console
-    console.warn('[comments] selection is empty, comment not created');
-    return;
-  }
-
-  const yState = getYSyncStateFromEditor();
-  if (!yState) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      '[comments] ySync state is not available, comment not created'
-    );
-    return;
-  }
-
-  const startRel = absolutePositionToRelativePosition(
-    from,
-    yState.type,
-    yState.binding.mapping
-  );
-  const endRel = absolutePositionToRelativePosition(
-    to,
-    yState.type,
-    yState.binding.mapping
-  );
-
-  if (!startRel || !endRel) {
-    // eslint-disable-next-line no-console
-    console.warn(
-      '[comments] failed to create relative positions for selection'
-    );
-    return;
-  }
-
-  const anchor: commentAnchor = {
-    start: relativePositionToBase64(startRel),
-    end: relativePositionToBase64(endRel),
-  };
-
-  const id =
-    typeof crypto !== 'undefined' && 'randomUUID' in crypto
-      ? crypto.randomUUID()
-      : String(Date.now());
-
-  const newComment: commentData = {
-    id,
-    text,
-    authorName: currentUser.name,
-    resolved: false,
-    anchor,
-  };
-
-  // Запись в Yjs: комментарий с якорем появится у всех клиентов
-  ydoc.transact(() => {
-    commentsMap.set(id, newComment);
-  });
-  history.logCommentCreated(id, text);
-  addText.value = '';
-};
-
-function handleAddCommentFromPopup(): void {
-  const text = selectionCommentText.value.trim();
-  if (!text) return;
-
-  // прокидываем текст в существующий поток создания комментария
-  addText.value = text;
-  addCommentFromSelection();
-  hideSelectionPopup();
-}
 
 const approveProposedChange = (id: string): void => {
   const change = proposedChangesMap.get(id);
@@ -1986,7 +1561,7 @@ const approveProposedChange = (id: string): void => {
   // Для kind === 'delete' по "Принять" удаляем текст из документа,
   // но карточку оставляем (меняется только статус).
   if (ed && change.kind === 'delete') {
-    const yState = getYSyncStateFromEditor();
+    const yState = getYSyncStateFromEditor(editor.value);
     if (yState) {
       const range = resolveAnchorRange(change.anchor, yState);
       if (range) {
@@ -2034,7 +1609,7 @@ const deleteProposedChange = (id: string): void => {
   // Для kind === 'delete' текст НЕ трогаем, только карточку.
   // Для любых approved-предложений — тоже только удаляем карточку.
   if (ed && change.status === 'pending' && change.kind === 'insert') {
-    const yState = getYSyncStateFromEditor();
+    const yState = getYSyncStateFromEditor(editor.value);
     if (yState) {
       const range = resolveAnchorRange(change.anchor, yState);
       if (range) {
@@ -2067,37 +1642,11 @@ const deleteProposedChange = (id: string): void => {
   }
 };
 
-const resolveComment = (id: string, resolved: boolean): void => {
-  const existing = commentsMap.get(id);
-  if (!existing) return;
-
-  const updated: commentData = {
-    ...existing,
-    resolved,
-  };
-
-  ydoc.transact(() => {
-    commentsMap.set(id, updated);
-  });
-
-  history.logCommentResolved(id, updated.text);
-};
-
 const clearHistory = (): void => {
   ydoc.transact(() => {
     historyMap.clear();
   });
   historyEntries.value = [];
-};
-
-const removeComment = (id: string): void => {
-  const existing = commentsMap.get(id);
-  ydoc.transact(() => {
-    commentsMap.delete(id);
-  });
-  if (existing) {
-    history.logCommentDeleted(id, existing.text);
-  }
 };
 </script>
 
