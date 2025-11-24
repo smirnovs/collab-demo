@@ -6,8 +6,9 @@
     "start": "node dist/server.js"
   },
   "dependencies": {
-    "@hocuspocus/extension-sqlite": "^3.4.0",
+    "@hocuspocus/extension-database": "^3.4.0",
     "@hocuspocus/server": "^3.4.0",
+    "sqlite3": "^5.1.7",
     "ws": "^8.18.0"
   },
   "devDependencies": {
