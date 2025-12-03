@@ -304,7 +304,7 @@ import Collaboration from '@tiptap/extension-collaboration';
 import CollaborationCaret from '@tiptap/extension-collaboration-caret';
 import { useSnapshots } from '../composables/useSnapshots';
 import { useHistory } from '../composables/useHistory';
-import { getCollabDoc } from '../shared/collabClient';
+import { useCollabDoc  } from '../composables/useCollabDoc.client';
 import {
   createRandomUser,
   refreshHighlights,
@@ -346,7 +346,7 @@ const currentUser: collabUser = createRandomUser();
 // Yjs + Hocuspocus
 // --------------------
 
-const { ydoc, provider } = getCollabDoc();
+const { ydoc, provider } = useCollabDoc();
 
 const history = useHistory({
   ydoc,

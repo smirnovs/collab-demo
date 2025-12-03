@@ -95,13 +95,13 @@
 import { computed, onMounted, onBeforeUnmount, ref } from 'vue';
 import * as Y from 'yjs';
 import type { snapshotEntry } from '../types/snapshotTypes';
-import { getCollabDoc } from '../shared/collabClient';
-import SnapshotDiffViewer from './SnapshotDiffViewer.vue';
+import { useCollabDoc  } from '../composables/useCollabDoc.client';
+import SnapshotDiffViewer from '../components/SnapshotDiffViewer.vue';
 import { useRouter } from 'vue-router';
 
 const router = useRouter();
 
-const { ydoc } = getCollabDoc();
+const { ydoc } = useCollabDoc();
 const snapshotsMap: Y.Map<snapshotEntry> =
   ydoc.getMap<snapshotEntry>('snapshots');
 

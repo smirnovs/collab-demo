@@ -1,4 +1,5 @@
 {
+  "name": "collab-server",
   "type": "module",
   "scripts": {
     "dev": "tsx src/server.ts",
